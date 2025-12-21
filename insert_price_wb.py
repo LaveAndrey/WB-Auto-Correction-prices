@@ -148,7 +148,7 @@ async def load_products(pool):
                 SELECT product_id, model, purchase_price, target_profit_rub,
                        length, width, height
                 FROM oc_product
-                WHERE status = 1 AND target_profit_rub > 0 AND wb_real_price = NULL
+                WHERE status = 1 AND target_profit_rub > 0 AND wb_real_price IS NULL
             """)
             return await cur.fetchall()
 
