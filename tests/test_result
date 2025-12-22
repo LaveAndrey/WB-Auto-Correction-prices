@@ -1,0 +1,62 @@
+tests/test_main.py::TestPriceUpdater::test_profit_below_target_increase_price PASSED [ 11%]
+Тест 1: Проверка расчета
+  Статус: ProcessingStatus.SUCCESS
+  Старая цена: 1200₽
+  Новая цена: 1250₽
+  Разница: 50₽
+  Причина: Изменение цены: +50.00 руб. Скидка: 10.0%
+
+tests/test_main.py::TestPriceUpdater::test_profit_above_target_decrease_price PASSED [ 22%]
+Тест 2: Прибыль выше цели
+  Статус: ProcessingStatus.SUCCESS
+  Изменение: 1200 → 702₽
+  Причина: Изменение цены: -498.00 руб. Скидка: 5.0%
+
+tests/test_main.py::TestPriceUpdater::test_insufficient_sales_skip PASSED [ 33%]
+Тест 3: Недостаточно продаж
+  Статус: ProcessingStatus.SKIPPED_NO_DATA
+  Причина: Недостаточно продаж: 2
+
+tests/test_main.py::TestPriceUpdater::test_price_below_minimum_skip PASSED [ 44%]
+Тест 4: Проверка минимальной цены
+  Статус: ProcessingStatus.SKIPPED_MIN_CHANGE
+  Причина: Изменение полной цены меньше порога: 44.00
+
+tests/test_main.py::TestPriceUpdater::test_small_change_skip PASSED      [ 55%]
+Тест 5: Малое изменение цены (порог 500₽)
+  Статус: ProcessingStatus.SKIPPED_MIN_CHANGE
+  Причина: Изменение полной цены меньше порога: 20.00
+
+tests/test_main.py::TestPriceUpdater::test_spp_calculation_correctness PASSED [ 66%]
+Тест 6: Расчет СПП
+  Статус: ProcessingStatus.SUCCESS
+  СПП: 25.0%
+
+tests/test_main.py::TestPriceUpdater::test_edge_case_zero_spp PASSED     [ 77%]
+Тест 7: СПП = 0%
+  Статус: ProcessingStatus.SUCCESS
+  СПП: 0.0%
+
+tests/test_main.py::TestPriceUpdater::test_invalid_discount_skip PASSED  [ 88%]
+Тест 8: Некорректный СПП
+  Статус: ProcessingStatus.SKIPPED_INVALID
+  Причина: Некорректная скидка из последней продажи
+
+tests/test_main.py::TestPriceUpdater::test_price_update_reason_formatting PASSED [100%]
+Тест 9: Форматирование причины
+
+1. С error_msg (как в реальном коде):
+  Повышение: Изменение цены: +200.00 руб. Скидка: 10.0%
+  Понижение: Изменение цены: -200.00 руб. Скидка: 10.0%
+  Без изменений: Цена без изменений
+
+2. Без error_msg (теоретический случай):
+  Повышение: Цена ↑ на 200 ₽
+  Понижение: Цена ↓ на 200 ₽
+  Без изменений: Цена без изменений
+
+3. Не-SUCCESS статусы:
+  SKIPPED_MIN_CHANGE с error_msg: Изменение меньше порога: 20.0 ₽
+  SKIPPED_MIN_CHANGE без error_msg: Изменение меньше порога
+
+✅ Все тесты свойства reason пройдены!
