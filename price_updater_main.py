@@ -633,16 +633,6 @@ class PriceUpdater:
             self.logger.info(f"   Целевая прибыль: {product.target_profit:.2f} ₽")
             self.logger.info(f"   Корректировка: {profit_correction:+.2f} ₽")
 
-
-            profit_deviation = product.target_profit - actual_profit
-            price_adjustment = profit_deviation / (1 - Config.BANK_COMMISSION)
-            new_finished = avg_finished + price_adjustment
-            self.logger.info(f"🔄 Новая finished цена для {vendor_code}:")
-            self.logger.info(f"   Старая: {avg_finished:.2f} ₽")
-            self.logger.info(f"   Новая: {new_finished:.2f} ₽")
-            self.logger.info(f"   Изменение: {(new_finished - avg_finished):+.2f} ₽")
-
-
             if not sales:
                 discount = None
             else:
@@ -663,8 +653,30 @@ class PriceUpdater:
                     sku_wb=product.sku_wb
                 )
 
-            # Расчет полной цены
-            new_full_price = round(new_finished / (1 - discount / 100.0), 0)
+            # ПРАВИЛЬНЫЙ РАСЧЕТ НОВОЙ ЦЕНЫ:
+            # 1. Нужная прибыль на руках (после всех вычетов)
+            needed_profit = product.purchase_price + product.target_profit  # 160 + 200 = 360
+
+            # 2. Нужный for_pay с учетом комиссии банка
+            needed_for_pay = needed_profit / (1 - Config.BANK_COMMISSION)  # 360 / 0.98 ≈ 367.35
+
+            # 3. Коэффициент конверсии finished → for_pay из текущих данных
+            if avg_finished > 0 and avg_clean_fpay > 0:
+                conversion_factor = avg_clean_fpay / avg_finished  # 298.55 / 395.28 ≈ 0.755
+                self.logger.info(f"📊 Коэффициент конверсии finished→for_pay: {conversion_factor:.3f}")
+            else:
+                # Fallback: предполагаем соотношение через скидку и комиссию
+                conversion_factor = (1 - discount / 100) * (1 - Config.BANK_COMMISSION)
+
+            # 4. Новая finished цена
+            new_finished = needed_for_pay / conversion_factor  # 367.35 / 0.755 ≈ 486.56
+            self.logger.info(f"🔄 Новая finished цена для {vendor_code}:")
+            self.logger.info(f"   Старая: {avg_finished:.2f} ₽")
+            self.logger.info(f"   Новая: {new_finished:.2f} ₽")
+            self.logger.info(f"   Изменение: {(new_finished - avg_finished):+.2f} ₽")
+
+            # 5. Расчет полной цены (с учетом СПП)
+            new_full_price = round(new_finished / (1 - discount / 100.0), 0)  # 486.56 / 0.62 ≈ 785
             self.logger.info(f"🔢 Расчет полной цены для {vendor_code}:")
             self.logger.info(f"   Finished цена: {new_finished:.2f} ₽")
             self.logger.info(f"   Скидка: {discount}%")
