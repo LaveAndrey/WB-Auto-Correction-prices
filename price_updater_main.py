@@ -362,6 +362,7 @@ class PriceUpdater:
             async with self.session.get(url, headers=headers, params=params) as resp:
                 if resp.status == 200:
                     data = await resp.json()
+                    self.logger.info(json.dumps(data, indent=2))
                     self.logger.info(f"Получено {len(data)} записей от WB API")
 
 
@@ -638,7 +639,7 @@ class PriceUpdater:
             else:
                 last_sale = max(sales, key=lambda s: self._parse_date(s.date))
                 discount = last_sale.spp_percent
-                self.logger.info(f"🎫 Скидка из последней продажи {vendor_code}: {discount}%")
+                self.logger.info(f"🎫 СПП из последней продажи {vendor_code}: {discount}%")
 
             if discount is None or not 0 <= discount < 100:
                 self.logger.warning(f"Некорректная скидка для {vendor_code}: {discount}")
@@ -1039,7 +1040,7 @@ class PriceUpdater:
                                      f"({real_change_sign}{real_price_change:.2f} ₽)")
                     self.logger.info(f"   Количество продаж: {sales_count}")
                     self.logger.info(f"   Средняя finished цена: {avg_finished:.2f} ₽")
-                    self.logger.info(f"   Скидка: {discount}%")
+                    self.logger.info(f"   СПП: {discount}%")
                     self.logger.info(f"   Статус: {update.status.value}")
                     self.logger.info(f"   Причина: {update.reason}")
 
