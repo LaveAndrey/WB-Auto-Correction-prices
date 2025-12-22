@@ -1,4 +1,5 @@
 import math
+import os
 import asyncio
 import aiomysql
 import requests
@@ -7,28 +8,35 @@ import logging
 import sys
 from datetime import date, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.interval import IntervalTrigger  # Изменено с CronTrigger
-# ----------------- НАСТРОЙКИ -----------------
+from apscheduler.triggers.interval import IntervalTrigger
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    print("Предупреждение: python-dotenv не установлен. Используются переменные окружения.")
+
 OC_DB_CONFIG = {
-    'host': '188.124.37.91',
-    'user': 'kraft_remote',
-    'password': 'LD3p7LWv7Ljjem42',
-    'db': 'testt',
-    'port': 3306,
+    'host': os.getenv('DB_HOST'),
+    'user': os.getenv('DB_USER'),
+    'password': os.getenv('DB_PASSWORD'),
+    'db': os.getenv('DB_NAME'),
+    'port': int(os.getenv('DB_PORT')),
     'autocommit': True,
     'charset': 'utf8mb4',
 }
 
-API_KEY = "eyJhbGciOiJFUzI1NiIsImtpZCI6IjIwMjUwOTA0djEiLCJ0eXAiOiJKV1QifQ.eyJhY2MiOjEsImVudCI6MSwiZXhwIjoxNzc5NzUxMjc3LCJpZCI6IjAxOWFiNTk4LWJlOWEtNzFhYi04NGJkLWRjMDY0ODNkNzU4NiIsImlpZCI6MTk3MDk1MzI3LCJvaWQiOjQyOTcyNDQsInMiOjE2MTI0LCJzaWQiOiJlZWZjYTVhMS0yODRjLTQyMjUtOTcwNi1hZjJhMDBmMzBjMzEiLCJ0IjpmYWxzZSwidWlkIjoxOTcwOTUzMjd9.MO1DnQSE8Jy3oXvLNTDDr_IK-u8QkL2JhCdui_-R1yv9Mx9fozcHDs3oQvlSxB3LBy_6iVhXYmfHYBxSQBSm4Q"
-WB_TARIFF_URL = "https://common-api.wildberries.ru/api/v1/tariffs/box"
-WAREHOUSE_NAME = "Маркетплейс: Южный федеральный округ"
 
-WB_COMMISSION = 0.14      # комиссия WB (по-умолчанию; можно получать динамически)
-BANK_RATE = 0.03          # эквайринг 3%
-BUFFER_COEFF = 1.1      # буфер под СПП: 1.10 = +10%. Поставь 1.0 чтобы отключить.
+API_KEY = os.getenv('WB_PRICES_TOKEN', 'your_default_token_here')
+WB_TARIFF_URL = "https://common-api.wildberries.ru/api/v1/tariffs/box"
+WAREHOUSE_NAME = os.getenv('WB_WAREHOUSE_NAME')
+
+WB_COMMISSION = float(os.getenv('WB_COMMISSION'))
+BANK_RATE = float(os.getenv('BANK_COMMISSION'))
+BUFFER_COEFF = float(os.getenv('BUFFER_COEFF'))
 
 # Интервал запуска (в секундах)
-INTERVAL_SECONDS = 3 * 60 * 60  # 2 часа
+INTERVAL_SECONDS = int(os.getenv('WB_FBS_INTERVAL'))
 
 scheduler = AsyncIOScheduler()
 
@@ -108,22 +116,22 @@ def calc_price_breakdown(cost, profit, logistics, buffer_coeff=1.0,
     profit = float(profit)
     logistics = float(logistics)
 
-    # 1) сумма, которую нужно получить на руки до логистики, с учётом прибыли
+
     base_needed = cost + profit
 
-    # 2) учёт эквайринга (поднимаем цену, чтобы после удержания эквайрингом осталось base_needed)
+
     after_bank = base_needed / (1.0 - bank_rate)
 
-    # 3) прибавляем логистику (фиксированная сумма)
+
     with_logistics = after_bank + logistics
 
-    # 4) учитываем комиссию WB: поднимаем, чтобы после комиссии осталось with_logistics
+
     before_buffer = with_logistics / (1.0 - wb_commission)
 
-    # 5) применяем буфер под СПП
+
     after_buffer = before_buffer * buffer_coeff
 
-    # 6) округлённая итоговая цена
+
     final_rounded = round(after_buffer)
 
     return {
@@ -248,16 +256,16 @@ async def scheduled_job():
     await main()   # твоя основная логика
 
 async def start():
-    # Первый запуск сразу при старте
+
     await main()
 
-    # Настройка периодического запуска каждые 2 часа
+
     scheduler.add_job(
         scheduled_job,
         IntervalTrigger(hours=2),  # Запуск каждые 2 часа
         id="wb_fbs_interval",
         replace_existing=True,
-        max_instances=1  # Не запускать параллельно, если предыдущий запуск еще не завершен
+        max_instances=1
     )
 
     scheduler.start()

@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 Тесты для системы ценообразования WB
 """
@@ -12,13 +10,11 @@ import pytz
 import sys
 import os
 
-# Добавляем путь к основному модулю
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-# Импортируем классы из основного файла
-from main import (
+from price_updater_main import (
     PriceUpdater, SaleData, ProductData, PriceUpdate,
-    ProcessingStatus, AnalyticsData, Config
+    ProcessingStatus, Config
 )
 
 
@@ -30,11 +26,11 @@ class TestPriceUpdater:
         """Мок конфигурации"""
         with patch('main.Config') as mock:
             # Базовые настройки
-            mock.BANK_COMMISSION = 0.02  # 2%
-            mock.MIN_MARGIN_FACTOR = 1.2  # 20%
-            mock.MIN_PRICE_CHANGE = 50  # ₽
-            mock.MIN_SALES_FOR_CALC = 3  # мин. продаж для расчета
-            mock.MAX_PRICE_CHANGE_PERCENT = 50.0  # 50%
+            mock.BANK_COMMISSION = 0.02
+            mock.MIN_MARGIN_FACTOR = 1.2
+            mock.MIN_PRICE_CHANGE = 50
+            mock.MIN_SALES_FOR_CALC = 3
+            mock.MAX_PRICE_CHANGE_PERCENT = 50.0
             mock.SALES_HOURS_FILTER = 24
             mock.CYCLE_INTERVAL = 3600
             mock.BATCH_SIZE = 100
@@ -73,9 +69,9 @@ class TestPriceUpdater:
         sale = SaleData(
             nm_id=123456,
             vendor_code="TEST001",
-            finished_price=1000.0,  # клиент заплатил 1000₽
-            for_pay=995.0,  # WB переведет 995₽
-            spp_percent=10.0,  # СПП 10%
+            finished_price=1000.0,
+            for_pay=995.0,
+            spp_percent=10.0,
             date=recent_date_str,
             quantity=1
         )
@@ -83,10 +79,10 @@ class TestPriceUpdater:
         # Данные товара
         product = ProductData(
             vendor_code="TEST001",
-            purchase_price=800.0,  # ВЫСОКАЯ себестоимость (чтобы прибыль была НИЖЕ цели)
-            target_profit=200.0,  # цель 200₽ прибыли
-            current_price_wb=1200.0,  # текущая цена на WB
-            current_real_price=1000.0,  # текущая выручка
+            purchase_price=800.0,
+            target_profit=200.0,
+            current_price_wb=1200.0,
+            current_real_price=1000.0,
             sku_wb=123456,
             status=1
         )
@@ -97,7 +93,7 @@ class TestPriceUpdater:
         # Вызов метода обработки
         result = await price_updater.process_product(
             vendor_code="TEST001",
-            sales=[sale, sale, sale, sale],  # 4 продажи (достаточно)
+            sales=[sale, sale, sale, sale],
             product=product
         )
 
@@ -117,9 +113,7 @@ class TestPriceUpdater:
         # 5. Нужно ПОВЫСИТЬ цену
 
         assert result.status == ProcessingStatus.SUCCESS
-        # В error_msg будет полное описание с суммой
         assert "Изменение цены" in result.error_msg
-        # profit_correction всегда положительное!
         assert result.profit_correction > 0
 
     @pytest.mark.asyncio
@@ -130,17 +124,17 @@ class TestPriceUpdater:
         sale = SaleData(
             nm_id=123457,
             vendor_code="TEST002",
-            finished_price=1000.0,  # хорошая цена продажи
+            finished_price=1000.0,
             for_pay=995.0,
-            spp_percent=5.0,  # низкий СПП
+            spp_percent=5.0,
             date=recent_date_str,
             quantity=1
         )
 
         product = ProductData(
             vendor_code="TEST002",
-            purchase_price=400.0,  # НИЗКАЯ себестоимость
-            target_profit=200.0,  # цель 200₽ прибыли
+            purchase_price=400.0,
+            target_profit=200.0,
             current_price_wb=1200.0,
             current_real_price=1000.0,
             sku_wb=123457,
@@ -151,7 +145,7 @@ class TestPriceUpdater:
 
         result = await price_updater.process_product(
             vendor_code="TEST002",
-            sales=[sale, sale, sale, sale, sale],  # 5 продаж
+            sales=[sale, sale, sale, sale, sale],
             product=product
         )
 
@@ -167,7 +161,6 @@ class TestPriceUpdater:
         # 4. Нужно ПОНИЗИТЬ цену
 
         assert result.status == ProcessingStatus.SUCCESS
-        # Цена должна понизиться (прибыль выше цели)
         assert result.new_price_wb < result.old_price_wb
 
     @pytest.mark.asyncio
@@ -200,7 +193,7 @@ class TestPriceUpdater:
         # Только 2 продажи при MIN_SALES_FOR_CALC=3
         result = await price_updater.process_product(
             vendor_code="TEST003",
-            sales=[sale, sale],  # Всего 2 продажи
+            sales=[sale, sale],
             product=product
         )
 
@@ -210,18 +203,18 @@ class TestPriceUpdater:
 
         assert result.status == ProcessingStatus.SKIPPED_NO_DATA
         assert "Недостаточно продаж" in result.error_msg
-        assert result.new_price_wb == 0  # Цена не установлена
+        assert result.new_price_wb == 0
 
     @pytest.mark.asyncio
     async def test_price_below_minimum_skip(self, price_updater, recent_date_str):
         """
         Тест 4: Цена ниже минимальной → пропуск
         """
-        # Создаем ситуацию где finished_price будет ниже минимальной
+
         sale = SaleData(
             nm_id=123459,
             vendor_code="TEST004",
-            finished_price=300.0,  # Очень низкая цена
+            finished_price=300.0,
             for_pay=298.0,
             spp_percent=5.0,
             date=recent_date_str,
@@ -230,8 +223,8 @@ class TestPriceUpdater:
 
         product = ProductData(
             vendor_code="TEST004",
-            purchase_price=300.0,  # себестоимость
-            target_profit=50.0,  # цель
+            purchase_price=300.0,
+            target_profit=50.0,
             current_price_wb=350.0,
             current_real_price=300.0,
             sku_wb=123459,
@@ -242,7 +235,7 @@ class TestPriceUpdater:
 
         result = await price_updater.process_product(
             vendor_code="TEST004",
-            sales=[sale, sale, sale, sale],  # 4 продажи
+            sales=[sale, sale, sale, sale],
             product=product
         )
 
@@ -281,25 +274,25 @@ class TestPriceUpdater:
             vendor_code="TEST005",
             purchase_price=600.0,
             target_profit=200.0,
-            current_price_wb=1000.0,  # Текущая цена близка к finished
+            current_price_wb=1000.0,
             current_real_price=1000.0,
             sku_wb=123460,
             status=1
         )
 
-        # Временно меняем MIN_PRICE_CHANGE на очень большое значение
+
         original_min_change = Config.MIN_PRICE_CHANGE
-        Config.MIN_PRICE_CHANGE = 500  # Очень большой порог
+        Config.MIN_PRICE_CHANGE = 500
 
         price_updater.fetch_nm_id = AsyncMock(return_value=123460)
 
         result = await price_updater.process_product(
             vendor_code="TEST005",
-            sales=[sale, sale, sale, sale],  # 4 продажи
+            sales=[sale, sale, sale, sale],
             product=product
         )
 
-        # Восстанавливаем значение
+
         Config.MIN_PRICE_CHANGE = original_min_change
 
         print(f"\nТест 5: Малое изменение цены (порог 500₽)")
@@ -331,9 +324,9 @@ class TestPriceUpdater:
             vendor_code="TEST006",
             finished_price=2000.0,
             for_pay=1990.0,
-            spp_percent=25.0,  # СПП 25%
+            spp_percent=25.0,
             date=recent_date_str,
-            quantity=2  # 2 штуки продано
+            quantity=2
         )
 
         product = ProductData(
@@ -348,10 +341,9 @@ class TestPriceUpdater:
 
         price_updater.fetch_nm_id = AsyncMock(return_value=123461)
 
-        # Нужно достаточно продаж! quantity=2 но это ОДНА запись
-        # MIN_SALES_FOR_CALC считает КОЛИЧЕСТВО ЗАПИСЕЙ, а не quantity!
 
-        # Создаем 4 записи (каждая с quantity=1), чтобы было достаточно
+
+
         sale_single = SaleData(
             nm_id=123461,
             vendor_code="TEST006",
@@ -380,7 +372,7 @@ class TestPriceUpdater:
         assert result.discount == 25.0
         assert result.analytics_data is not None
         # В analytics учитывается quantity!
-        assert result.analytics_data.total_sales == 4  # 4 записи × quantity=1
+        assert result.analytics_data.total_sales == 4
 
     @pytest.mark.asyncio
     async def test_edge_case_zero_spp(self, price_updater, recent_date_str):
@@ -411,7 +403,7 @@ class TestPriceUpdater:
 
         result = await price_updater.process_product(
             vendor_code="TEST007",
-            sales=[sale, sale, sale, sale],  # 4 продажи
+            sales=[sale, sale, sale, sale],
             product=product
         )
 
@@ -438,7 +430,7 @@ class TestPriceUpdater:
             vendor_code="TEST008",
             finished_price=1000.0,
             for_pay=995.0,
-            spp_percent=-10.0,  # Отрицательный СПП - ошибка!
+            spp_percent=-10.0,
             date=recent_date_str,
             quantity=1
         )
@@ -457,7 +449,7 @@ class TestPriceUpdater:
 
         result = await price_updater.process_product(
             vendor_code="TEST008",
-            sales=[sale, sale, sale, sale],  # 4 продажи
+            sales=[sale, sale, sale, sale],
             product=product
         )
 
@@ -478,22 +470,22 @@ class TestPriceUpdater:
         """
         print(f"\nТест 9: Форматирование причины")
 
-        # ТЕСТ 1: С error_msg (как в реальном коде)
+
         print("\n1. С error_msg (как в реальном коде):")
 
-        # Тест повышения цены С error_msg
+
         update1 = PriceUpdate(
             vendor_code="TEST009",
             new_price_wb=1500.0,
             new_real_price=1200.0,
             old_price_wb=1300.0,
-            profit_correction=200.0,  # ВСЕГДА положительное!
+            profit_correction=200.0,
             status=ProcessingStatus.SUCCESS,
-            error_msg="Изменение цены: +200.00 руб. Скидка: 10.0%"  # error_msg заполнен!
+            error_msg="Изменение цены: +200.00 руб. Скидка: 10.0%"
         )
         print(f"  Повышение: {update1.reason}")
         assert update1.reason == "Изменение цены: +200.00 руб. Скидка: 10.0%"
-        assert "Цена ↑" not in update1.reason  # Не должно быть, т.к. error_msg заполнен
+        assert "Цена ↑" not in update1.reason
 
         # Тест понижения цены С error_msg
         update2 = PriceUpdate(
@@ -501,7 +493,7 @@ class TestPriceUpdater:
             new_price_wb=1100.0,
             new_real_price=900.0,
             old_price_wb=1300.0,
-            profit_correction=200.0,  # ВСЕГДА положительное!
+            profit_correction=200.0,
             status=ProcessingStatus.SUCCESS,
             error_msg="Изменение цены: -200.00 руб. Скидка: 10.0%"  # error_msg заполнен!
         )
@@ -517,7 +509,7 @@ class TestPriceUpdater:
             old_price_wb=1300.0,
             profit_correction=0.0,
             status=ProcessingStatus.SUCCESS,
-            error_msg="Цена без изменений"  # error_msg заполнен!
+            error_msg="Цена без изменений"
         )
         print(f"  Без изменений: {update3.reason}")
         assert update3.reason == "Цена без изменений"
@@ -533,7 +525,7 @@ class TestPriceUpdater:
             old_price_wb=1300.0,
             profit_correction=200.0,
             status=ProcessingStatus.SUCCESS,
-            error_msg=""  # ПУСТОЙ! Теперь reason вычислит направление
+            error_msg=""
         )
         print(f"  Повышение: {update4.reason}")
         assert "Цена ↑" in update4.reason
@@ -547,13 +539,13 @@ class TestPriceUpdater:
             old_price_wb=1300.0,
             profit_correction=200.0,
             status=ProcessingStatus.SUCCESS,
-            error_msg=""  # ПУСТОЙ!
+            error_msg=""
         )
         print(f"  Понижение: {update5.reason}")
         assert "Цена ↓" in update5.reason
         assert "200" in update5.reason
 
-        # Тест без изменений БЕЗ error_msg
+
         update6 = PriceUpdate(
             vendor_code="TEST014",
             new_price_wb=1300.0,
@@ -561,12 +553,12 @@ class TestPriceUpdater:
             old_price_wb=1300.0,
             profit_correction=0.0,
             status=ProcessingStatus.SUCCESS,
-            error_msg=""  # ПУСТОЙ!
+            error_msg=""
         )
         print(f"  Без изменений: {update6.reason}")
         assert "Цена без изменений" in update6.reason
 
-        # ТЕСТ 3: Не-SUCCESS статусы
+
         print("\n3. Не-SUCCESS статусы:")
 
         update7 = PriceUpdate(
@@ -576,7 +568,7 @@ class TestPriceUpdater:
             old_price_wb=1300.0,
             profit_correction=0.0,
             status=ProcessingStatus.SKIPPED_MIN_CHANGE,
-            error_msg="Изменение меньше порога: 20.0 ₽"  # error_msg будет возвращен
+            error_msg="Изменение меньше порога: 20.0 ₽"
         )
         print(f"  SKIPPED_MIN_CHANGE с error_msg: {update7.reason}")
         assert update7.reason == "Изменение меньше порога: 20.0 ₽"
@@ -588,7 +580,7 @@ class TestPriceUpdater:
             old_price_wb=1300.0,
             profit_correction=0.0,
             status=ProcessingStatus.SKIPPED_MIN_CHANGE,
-            error_msg=""  # Пустой error_msg - используем словарь
+            error_msg=""
         )
         print(f"  SKIPPED_MIN_CHANGE без error_msg: {update8.reason}")
         assert "Изменение меньше порога" in update8.reason
@@ -602,7 +594,6 @@ if __name__ == "__main__":
     print("Запуск тестов системы ценообразования WB")
     print("=" * 80)
 
-    # Создаем event loop для асинхронных тестов
     import asyncio
 
 
@@ -610,7 +601,7 @@ if __name__ == "__main__":
         """Запуск всех тестов"""
         updater_tester = TestPriceUpdater()
 
-        # Создаем фикстуры
+
         mock_config = Mock()
         mock_config.BANK_COMMISSION = 0.02
         mock_config.MIN_MARGIN_FACTOR = 1.2
