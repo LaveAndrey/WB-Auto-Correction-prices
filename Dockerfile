@@ -23,5 +23,5 @@ COPY . .
 # Создаем директорию для логов
 RUN mkdir -p /app/logs
 
-# Указываем команду по умолчанию (запуск обоих скриптов)
-CMD ["sh", "-c", "python insert_price_wb.py & python price_updater_main.py"]
+# Указываем команду по умолчанию - запускаем оба скрипта параллельно
+CMD ["sh", "-c", "python insert_price_wb.py & python price_updater_main.py & wait"]

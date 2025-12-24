@@ -29,7 +29,7 @@ try:
 except ImportError:
     print("Предупреждение: python-dotenv не установлен. Используются переменные окружения.")
 
-LOAD_PRICE_TO_WB = False
+LOAD_PRICE_TO_WB = True
 
 
 # === КОНФИГУРАЦИЯ ===
@@ -276,6 +276,7 @@ class PriceUpdater:
             async with self.session.get(url, headers=headers, params=params) as resp:
                 if resp.status == 200:
                     data = await resp.json()
+                    print(json.dumps(data, indent=2))
                     self.logger.info(f"Получено {len(data)} записей от WB API с {date_from}")
 
                     # ДЕБАГ: выводим времена первых записей
@@ -735,8 +736,8 @@ class PriceUpdater:
                         INSERT INTO oc_product_price_history 
                         (product_id, vendor_code, old_price_wb, new_price_wb,
                          old_real_price, new_real_price, profit_correction,
-                         discount, change_reason, status, created_at)
-                        SELECT product_id, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                         discount, change_reason, status, created_at, sale_count)
+                        SELECT product_id, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                         FROM oc_product WHERE model = %s
                     """, (
                         update.vendor_code,
@@ -749,6 +750,7 @@ class PriceUpdater:
                         update.reason,
                         update.status.value,
                         datetime.now(pytz.timezone('Europe/Moscow')),
+
                         update.vendor_code
                     ))
 
