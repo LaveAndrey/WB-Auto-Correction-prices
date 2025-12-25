@@ -737,7 +737,7 @@ class PriceUpdater:
                         (product_id, vendor_code, old_price_wb, new_price_wb,
                          old_real_price, new_real_price, profit_correction,
                          discount, change_reason, status, created_at, sale_count)
-                        SELECT product_id, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                        SELECT product_id, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                         FROM oc_product WHERE model = %s
                     """, (
                         update.vendor_code,
@@ -750,8 +750,6 @@ class PriceUpdater:
                         update.reason,
                         update.status.value,
                         datetime.now(pytz.timezone('Europe/Moscow')),
-
-                        update.vendor_code
                     ))
 
                     self.stats['prices_updated'] += 1
