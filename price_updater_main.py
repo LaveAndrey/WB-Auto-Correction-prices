@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-LOAD_PRICE_TO_WB = False
+LOAD_PRICE_TO_WB = True
 
 
 class Config:
