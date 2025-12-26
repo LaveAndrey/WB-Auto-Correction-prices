@@ -19,12 +19,9 @@ import aiomysql
 import aiohttp
 from aiohttp import ClientTimeout, ClientSession
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from dotenv import load_dotenv
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
+load_dotenv()
 
 LOAD_PRICE_TO_WB = False
 
@@ -679,8 +676,10 @@ class PriceUpdater:
                 finished_price=0
             )
 
-    def _validate_price_update(self, vendor_code: str, product: ProductData,
-                               new_price_wd: float, new_total_price: float,
+    def _validate_price_update(self, vendor_code: str,
+                               product: ProductData,
+                               new_price_wd: float,
+                               new_total_price: float,
                                profit_diff: float) -> Optional[PriceUpdate]:
         min_price = product.purchase_price * Config.MIN_MARGIN_FACTOR
         if new_price_wd < min_price:

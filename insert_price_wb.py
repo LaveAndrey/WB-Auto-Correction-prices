@@ -35,11 +35,11 @@ ORDERS_API_URL = "https://statistics-api.wildberries.ru/api/v1/supplier/orders"
 WAREHOUSES_API_URL = "https://supplies-api.wildberries.ru/api/v1/warehouses"
 
 # Запасной ID склада из настроек
-DEFAULT_WAREHOUSE_ID = int(os.getenv('WB_WAREHOUSE_ID', '301808'))
+DEFAULT_WAREHOUSE_ID = int(os.getenv('WB_WAREHOUSE_ID'))
 WB_COMMISSION = float(os.getenv('WB_COMMISSION'))
 BANK_RATE = float(os.getenv('BANK_COMMISSION'))
 BUFFER_COEFF = float(os.getenv('BUFFER_COEFF'))
-BOX_TYPE_ID = int(os.getenv('WB_BOX_TYPE', '2'))
+BOX_TYPE_ID = int(os.getenv('WB_BOX_TYPE'))
 
 scheduler = AsyncIOScheduler()
 
