@@ -168,6 +168,7 @@ class PriceUpdate:
     spp_used: float = 0
     purchase_price: float = 0
     old_real_price: float = 0
+    target_forpay: float = 0
 
     @property
     def reason(self) -> str:
@@ -209,7 +210,21 @@ class PriceUpdater:
         logger = logging.getLogger('price_updater')
         logger.setLevel(logging.DEBUG)
 
-        formatter = logging.Formatter(
+        class MoscowTimeFormatter(logging.Formatter):
+            def __init__(self, fmt=None, datefmt=None):
+                super().__init__(fmt, datefmt)
+                self.moscow_tz = pytz.timezone('Europe/Moscow')
+
+            def formatTime(self, record, datefmt=None):
+                dt_utc = datetime.utcfromtimestamp(record.created).replace(tzinfo=pytz.utc)
+                dt_moscow = dt_utc.astimezone(self.moscow_tz)
+
+                if datefmt:
+                    return dt_moscow.strftime(datefmt)
+                else:
+                    return dt_moscow.isoformat()
+
+        formatter = MoscowTimeFormatter(
             '%(asctime)s | %(levelname)-8s | %(name)s | %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
         )
@@ -281,6 +296,7 @@ class PriceUpdater:
             async with self.session.get(url, headers=headers, params=params) as resp:
                 if resp.status == 200:
                     data = await resp.json()
+                    self.logger.info(json.dumps(data, indent=2, ensure_ascii=False))
                     self.logger.info(f"Получено {len(data)} записей от WB API с {date_from}")
 
                     # Логируем все полученные продажи для отладки
@@ -690,50 +706,75 @@ class PriceUpdater:
             if api_discount >= 100:
                 api_discount = 99.9
 
+            # 1. Собираем фактические данные из продаж
             price_wd_list = []
-            net_forpay_list = []
-
-            last_spp = self._get_last_non_zero_spp(valid_sales)
-            self.logger.info(f"Используемый СПП: {last_spp}%")
+            forpay_list = []
+            forpay_to_price_ratios = []
 
             for sale in valid_sales:
-                net_forpay = sale.for_pay - logistics_cost
                 price_wd_list.append(sale.price_with_desc)
-                net_forpay_list.append(net_forpay)
+                forpay_list.append(sale.for_pay)
+                if sale.price_with_desc > 0 and sale.for_pay > 0:
+                    ratio = sale.for_pay / sale.price_with_desc
+                    forpay_to_price_ratios.append(ratio)
 
             avg_price_wd = statistics.mean(price_wd_list)
-            avg_net_forpay = statistics.mean(net_forpay_list)
+            avg_forpay = statistics.mean(forpay_list)
 
-            self.logger.info(f"Средняя цена со скидкой (avg_price_wd): {avg_price_wd:.2f}₽")
-            self.logger.info(f"Средний чистый доход (avg_net_forpay): {avg_net_forpay:.2f}₽")
-            self.logger.info(f"Используемая скидка (из API WB): {api_discount:.1f}%")
+            # Рассчитываем среднее соотношение forPay к priceWithDisc
+            avg_ratio = statistics.mean(forpay_to_price_ratios) if forpay_to_price_ratios else 0.674
+
+            self.logger.info(f"Анализ продаж:")
+            self.logger.info(f"  Средний priceWithDisc: {avg_price_wd:.2f}₽")
+            self.logger.info(f"  Средний forPay: {avg_forpay:.2f}₽")
+            self.logger.info(f"  Соотношение forPay/priceWithDisc: {avg_ratio:.3f}")
+            self.logger.info(f"  (рассчитано на основе {len(forpay_to_price_ratios)} продаж)")
+            self.logger.info(f"Используемая скидка: {api_discount:.1f}%")
             self.logger.info(f"Логистика: {logistics_cost:.2f}₽")
             self.logger.info(f"Закупочная цена: {product.purchase_price:.2f}₽")
             self.logger.info(f"Целевая прибыль: {product.target_profit:.2f}₽")
 
-            bank_commission = avg_net_forpay * Config.BANK_COMMISSION
-            current_profit = avg_net_forpay - bank_commission - product.purchase_price
-            profit_diff = product.target_profit - current_profit
+            # 2. Рассчитываем ТЕКУЩУЮ прибыль (правильно!)
+            bank_commission_current = avg_forpay * Config.BANK_COMMISSION
+            current_profit = avg_forpay - logistics_cost - bank_commission_current - product.purchase_price
 
-            self.logger.info(f"Банковская комиссия ({Config.BANK_COMMISSION * 100:.1f}%): {bank_commission:.2f}₽")
             self.logger.info(f"Текущая прибыль: {current_profit:.2f}₽")
-            self.logger.info(f"Разница прибыли (profit_diff): {profit_diff:.2f}₽")
+            self.logger.info(
+                f"  forPay: {avg_forpay:.2f}₽ - логистика: {logistics_cost:.2f}₽ - банк: {bank_commission_current:.2f}₽ - закуп: {product.purchase_price:.2f}₽")
 
-            new_price_wd = avg_price_wd + profit_diff
-            self.logger.info(f"Новая цена со скидкой (new_price_wd): {new_price_wd:.2f}₽ "
-                             f"({avg_price_wd:.2f} + {profit_diff:.2f})")
+            # 3. Рассчитываем ЦЕЛЕВОЙ forPay для прибыли 200₽
+            target_forpay = (product.target_profit + logistics_cost + product.purchase_price) / (
+                        1 - Config.BANK_COMMISSION)
 
-            if last_spp > 0:
-                finished_price = new_price_wd * (1 - (last_spp / 100))
-                self.logger.info(f"Цена с учетом СПП {last_spp}%: {finished_price:.2f}₽")
-            else:
-                finished_price = new_price_wd
+            # Проверка расчета
+            bank_commission_target = target_forpay * Config.BANK_COMMISSION
+            expected_profit = target_forpay - logistics_cost - bank_commission_target - product.purchase_price
 
+            self.logger.info(f"Для прибыли {product.target_profit}₽ нужен forPay: {target_forpay:.2f}₽")
+            self.logger.info(
+                f"  Проверка: {target_forpay:.2f}₽ - {logistics_cost:.2f}₽ - {bank_commission_target:.2f}₽ - {product.purchase_price:.2f}₽ = {expected_profit:.2f}₽")
+
+            # 4. Рассчитываем НУЖНЫЙ priceWithDisc
+            required_price_wd = target_forpay / avg_ratio
+
+            self.logger.info(f"Расчет нужного priceWithDisc:")
+            self.logger.info(f"  target_forpay / avg_ratio")
+            self.logger.info(f"  {target_forpay:.2f} / {avg_ratio:.3f}")
+            self.logger.info(f"  = {required_price_wd:.2f}₽")
+
+            # Устанавливаем новую цену
+            new_price_wd = required_price_wd
+
+            # Разница для логирования
+            price_wd_diff = new_price_wd - avg_price_wd
+            self.logger.info(f"Корректировка: {avg_price_wd:.0f}₽ → {new_price_wd:.0f}₽ ({price_wd_diff:+.0f}₽)")
+
+            # 5. Проверяем минимальную цену
             min_price = product.purchase_price * Config.MIN_MARGIN_FACTOR
-            self.logger.info(f"Минимальная цена (MIN_MARGIN_FACTOR={Config.MIN_MARGIN_FACTOR}): {min_price:.2f}₽")
+            self.logger.info(f"Минимальная цена (×{Config.MIN_MARGIN_FACTOR}): {min_price:.2f}₽")
 
             if new_price_wd < min_price:
-                self.logger.warning(f"Новая цена ниже минимальной: {new_price_wd:.0f} < {min_price:.0f}")
+                self.logger.warning(f"Цена ниже минимальной: {new_price_wd:.0f} < {min_price:.0f}")
                 await self.db_logger.log(
                     level="WARNING",
                     message=f"Цена ниже минимальной",
@@ -745,28 +786,35 @@ class PriceUpdater:
                     }
                 )
                 new_price_wd = min_price
-                profit_diff = new_price_wd - avg_price_wd
-                self.logger.info(f"Скорректированная new_price_wd: {new_price_wd:.2f}₽")
-                self.logger.info(f"Скорректированный profit_diff: {profit_diff:.2f}₽")
+                price_wd_diff = new_price_wd - avg_price_wd
+                self.logger.info(f"Скорректировано до: {new_price_wd:.2f}₽")
 
-            # Используем скидку из API для расчета полной цены
+            spp = self._get_last_non_zero_spp(sales)
+
+            # 6. Игнорируем СПП в расчетах прибыли
+            finished_price = new_price_wd * (1 - spp / 100)
+            self.logger.info(f"Цена со скидкой (finished_price): {finished_price:.2f}₽")
+
+            # 7. Расчет полной цены на WB с учетом скидки
+            if api_discount >= 100:
+                api_discount = 99.9
+
             new_total_price = new_price_wd / (1 - api_discount / 100)
             new_total_price_rounded = round(new_total_price, 0)
 
-            self.logger.info(f"Расчет новой полной цены на WB:")
-            self.logger.info(f"  new_price_wd / (1 - api_discount/100)")
+            self.logger.info(f"Расчет полной цены на WB:")
             self.logger.info(f"  {new_price_wd:.2f} / (1 - {api_discount / 100:.3f})")
-            self.logger.info(f"  {new_price_wd:.2f} / {1 - api_discount / 100:.3f}")
             self.logger.info(f"  = {new_total_price:.2f}₽")
             self.logger.info(f"  Округлено: {new_total_price_rounded:.0f}₽")
             self.logger.info(f"Старая цена на WB: {product.current_price_wb:.0f}₽")
-            self.logger.info(f"Изменение цены: {new_total_price_rounded - product.current_price_wb:.0f}₽")
+            self.logger.info(f"Изменение цены: {new_total_price_rounded - product.current_price_wb:+.0f}₽")
 
+            # 8. Валидация
             validation = self._validate_price_update(
-                vendor_code, product, new_price_wd, new_total_price_rounded, profit_diff
+                vendor_code, product, new_price_wd, new_total_price_rounded, price_wd_diff
             )
             if validation:
-                validation.discount = api_discount  # Добавляем скидку в результат
+                validation.discount = api_discount
                 validation.logistics_cost = logistics_cost
                 await self.db_logger.log(
                     level="WARNING",
@@ -777,24 +825,29 @@ class PriceUpdater:
                 self.logger.info(f"=== РАСЧЕТ ПРЕРВАН: {validation.reason} ===")
                 return validation
 
+
+
+
+            # 9. Создаем результат
             update = PriceUpdate(
                 vendor_code=vendor_code,
                 new_price_wb=new_total_price_rounded,
                 new_real_price=round(new_price_wd, 2),
                 old_price_wb=product.current_price_wb,
                 old_real_price=product.current_real_price,
-                profit_correction=abs(profit_diff),
+                profit_correction=abs(price_wd_diff),
                 status=ProcessingStatus.SUCCESS,
-                error_msg=f"Корректировка прибыли: {profit_diff:+.0f} ₽",
-                discount=api_discount,  # Используем скидку из API
+                error_msg=f"Корректировка прибыли: {product.target_profit - current_profit:+.0f} ₽",
+                discount=api_discount,
                 sku_wb=product.sku_wb,
                 logistics_cost=logistics_cost,
                 finished_price=finished_price,
                 current_profit=current_profit,
                 target_profit=product.target_profit,
                 sales_count=len(valid_sales),
-                spp_used=last_spp,
-                purchase_price=product.purchase_price
+                spp_used=spp,  # СПП не учитываем
+                purchase_price=product.purchase_price,
+                target_forpay=target_forpay
             )
 
             await self.db_logger.log(
@@ -805,19 +858,23 @@ class PriceUpdater:
                     "old_price": product.current_price_wb,
                     "new_price": new_total_price_rounded,
                     "price_change": new_total_price_rounded - product.current_price_wb,
-                    "profit_correction": profit_diff,
-                    "finished_price": finished_price,
-                    "discount": api_discount,
-                    "discount_source": "wb_api" if discounts_info.get(product.sku_wb) else "sales_fallback"
+                    "old_price_wd": avg_price_wd,
+                    "new_price_wd": new_price_wd,
+                    "price_wd_diff": price_wd_diff,
+                    "current_profit": current_profit,
+                    "target_profit": product.target_profit,
+                    "profit_diff": product.target_profit - current_profit,
+                    "avg_ratio_forpay_to_price": avg_ratio,
+                    "target_forpay": target_forpay,
+                    "expected_profit_with_new_price": expected_profit
                 }
             )
 
             self.logger.info(f"=== РАСЧЕТ ЗАВЕРШЕН ДЛЯ {vendor_code} ===")
-            self.logger.info(f"Итог: {product.current_price_wb:.0f}₽ → {new_total_price_rounded:.0f}₽ "
-                             f"({new_total_price_rounded - product.current_price_wb:+.0f}₽)")
-            self.logger.info(f"Прибыль: {current_profit:.0f}₽ → {product.target_profit:.0f}₽ "
-                             f"({profit_diff:+.0f}₽)")
-            self.logger.info(f"Скидка (из API WB): {api_discount:.1f}%")
+            self.logger.info(f"Итог: {product.current_price_wb:.0f}₽ → {new_total_price_rounded:.0f}₽")
+            self.logger.info(f"Прибыль: {current_profit:.0f}₽ → {product.target_profit:.0f}₽")
+            self.logger.info(f"priceWithDisc: {avg_price_wd:.0f}₽ → {new_price_wd:.0f}₽")
+            self.logger.info(f"forPay: {avg_forpay:.0f}₽ → {target_forpay:.0f}₽")
 
             return update
 
@@ -830,7 +887,7 @@ class PriceUpdater:
                 level="ERROR",
                 message=f"Ошибка обработки",
                 vendor_code=vendor_code,
-                details={"error": str(e), "traceback": traceback.format_exc()[-500:]}
+                details={"error": str(e)}
             )
 
             return PriceUpdate(
@@ -941,6 +998,18 @@ class PriceUpdater:
                 async with conn.cursor() as cur:
                     current_time = datetime.now(pytz.timezone('Europe/Moscow'))
 
+                    # ВАЖНО: Рассчитываем ОЖИДАЕМУЮ прибыль с НОВОЙ ценой
+                    # У нас есть target_forpay, который мы рассчитали для новой цены
+                    # Прибыль с новой ценой должна быть target_profit (или близко к ней)
+
+                    # Просто используем target_profit как ожидаемую прибыль
+                    expected_profit_after_change = update.target_profit
+
+                    # Или можем пересчитать для точности:
+                    # expected_forpay = update.target_forpay
+                    # expected_bank = expected_forpay * Config.BANK_COMMISSION
+                    # expected_profit_after_change = expected_forpay - update.logistics_cost - expected_bank - update.purchase_price
+
                     await cur.execute("""
                         UPDATE oc_product 
                         SET price_wb = %s, 
@@ -996,7 +1065,7 @@ class PriceUpdater:
                         update.reason,
                         update.status.value,
                         current_time,
-                        update.current_profit,
+                        expected_profit_after_change,  # ← ОЖИДАЕМАЯ прибыль с новой ценой
                         update.target_profit,
                         update.sales_count,
                         update.spp_used,
@@ -1007,7 +1076,11 @@ class PriceUpdater:
 
                     self.stats['prices_updated'] += 1
 
-                    profit_diff = update.target_profit - update.current_profit
+                    # Логируем с правильными значениями
+                    profit_before = update.current_profit  # Прибыль ДО изменения
+                    profit_after = expected_profit_after_change  # Ожидаемая прибыль ПОСЛЕ
+                    profit_diff = profit_after - profit_before
+
                     await self.db_logger.log(
                         level="SUCCESS",
                         message=f"Цена сохранена с деталями прибыли",
@@ -1016,17 +1089,20 @@ class PriceUpdater:
                             "old_price": update.old_price_wb,
                             "new_price": update.new_price_wb,
                             "price_change": update.new_price_wb - update.old_price_wb,
-                            "current_profit": f"{update.current_profit:.0f} ₽",
-                            "target_profit": f"{update.target_profit:.0f} ₽",
+                            "profit_before": f"{profit_before:.0f} ₽",
+                            "expected_profit_after": f"{profit_after:.0f} ₽",
                             "profit_diff": f"{profit_diff:+.0f} ₽",
+                            "target_profit": f"{update.target_profit:.0f} ₽",
                             "sales_used": update.sales_count,
-                            "spp_used": f"{update.spp_used:.1f}%",
                             "logistics": f"{update.logistics_cost:.0f} ₽",
                             "purchase_price": f"{update.purchase_price:.0f} ₽"
                         }
                     )
 
                     self.logger.info(f"Цена и детальная история обновлены: {update.vendor_code}")
+                    self.logger.info(f"Прибыль до изменения: {profit_before:.0f}₽")
+                    self.logger.info(f"Ожидаемая прибыль после изменения: {profit_after:.0f}₽")
+                    self.logger.info(f"Изменение прибыли: {profit_diff:+.0f}₽")
 
         except Exception as e:
             error_msg = f"Ошибка сохранения цены для {update.vendor_code}: {e}"
@@ -1042,7 +1118,6 @@ class PriceUpdater:
                     "cycle_id": self.current_cycle
                 }
             )
-
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=4, max=10),
