@@ -25,7 +25,6 @@ load_dotenv()
 
 LOAD_PRICE_TO_WB = True
 
-
 class Config:
     DB_HOST = os.getenv('DB_HOST')
     DB_USER = os.getenv('DB_USER')
@@ -245,8 +244,31 @@ class PriceUpdater:
 
         return logger
 
+    def _log_separator(self, title: str = "", char: str = "=", length: int = 80):
+        """Визуальный разделитель для логов"""
+        if title:
+            padding = (length - len(title) - 4) // 2
+            self.logger.info(f"\n{char * padding} {title} {char * padding}")
+        else:
+            self.logger.info(f"\n{char * length}")
+
+    def _log_table(self, title: str, data: dict):
+        """Логирование данных в табличном формате"""
+        self._log_separator(title, "-")
+        max_key_len = max(len(str(k)) for k in data.keys())
+
+        for key, value in data.items():
+            if isinstance(value, float):
+                value_str = f"{value:,.2f}" if value >= 1000 else f"{value:.2f}"
+            else:
+                value_str = str(value)
+
+            self.logger.info(f"  {key:<{max_key_len}} : {value_str}")
+        self._log_separator("-", "-")
+
     async def initialize(self):
-        self.logger.info("Инициализация системы ценообразования...")
+        self._log_separator("НАЧАЛО РАБОТЫ СИСТЕМЫ ЦЕНООБРАЗОВАНИЯ", "=")
+        self.logger.info("Инициализация системы...")
 
         try:
             self.db_pool = await aiomysql.create_pool(
@@ -261,17 +283,29 @@ class PriceUpdater:
                 maxsize=Config.WORKERS_COUNT * 2,
                 pool_recycle=3600
             )
-            self.logger.info("✓ БД подключена")
+            self.logger.info("✅ Подключение к базе данных: УСПЕШНО")
             self.db_logger = DatabaseLogger(self.db_pool)
 
         except Exception as e:
-            self.logger.error(f"✗ БД недоступна: {e}")
+            self.logger.error(f"❌ Подключение к базе данных: ОШИБКА - {e}")
             raise
 
         timeout = ClientTimeout(total=60)
         self.session = ClientSession(timeout=timeout)
         self.queue = asyncio.Queue(maxsize=Config.MAX_QUEUE_SIZE)
-        self.logger.info("Инициализация завершена")
+
+        self._log_table("КОНФИГУРАЦИЯ СИСТЕМЫ", {
+            "WORKERS_COUNT": Config.WORKERS_COUNT,
+            "BATCH_SIZE": Config.BATCH_SIZE,
+            "SALES_HOURS_FILTER": f"{Config.SALES_HOURS_FILTER}ч",
+            "CYCLE_INTERVAL": f"{Config.CYCLE_INTERVAL // 3600}ч {(Config.CYCLE_INTERVAL % 3600) // 60}м",
+            "MIN_SALES_FOR_CALC": Config.MIN_SALES_FOR_CALC,
+            "MIN_MARGIN_FACTOR": f"×{Config.MIN_MARGIN_FACTOR}",
+            "BANK_COMMISSION": f"{Config.BANK_COMMISSION * 100}%"
+        })
+
+        self.logger.info("✅ Инициализация завершена успешно")
+        self._log_separator()
 
     @retry(
         stop=stop_after_attempt(3),
@@ -279,9 +313,14 @@ class PriceUpdater:
         retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError))
     )
     async def fetch_wb_sales(self) -> List[SaleData]:
+        self._log_separator("ПОЛУЧЕНИЕ ПРОДАЖ С WB", "-")
+
         moscow_tz = pytz.timezone('Europe/Moscow')
         period_start = datetime.now(moscow_tz) - timedelta(hours=Config.SALES_HOURS_FILTER)
         date_from = period_start.strftime("%Y-%m-%dT%H:%M:%S")
+
+        self.logger.info(f"📊 Запрашиваем продажи за последние {Config.SALES_HOURS_FILTER} часов")
+        self.logger.info(f"📅 Период: с {date_from}")
 
         url = "https://statistics-api.wildberries.ru/api/v1/supplier/sales"
         headers = {
@@ -296,41 +335,46 @@ class PriceUpdater:
             async with self.session.get(url, headers=headers, params=params) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    self.logger.info(json.dumps(data, indent=2, ensure_ascii=False))
-                    self.logger.info(f"Получено {len(data)} записей от WB API с {date_from}")
-
-                    # Логируем все полученные продажи для отладки
-                    for item in data:
-                        if item.get("supplierArticle"):
-                            self.logger.debug(f"Продажа: vendor_code={item.get('supplierArticle')}, "
-                                              f"totalPrice={item.get('totalPrice')}, "
-                                              f"discount={item.get('discountPercent')}%")
+                    self.logger.info(f"📥 Получено {len(data)} записей от WB API")
 
                     sales = []
+                    invalid_sales = 0
+
                     for item in data:
                         if item.get("isRealization"):
                             sale = SaleData.from_api_dict(item)
                             if sale and sale.finished_price > 0:
                                 sales.append(sale)
+                            else:
+                                invalid_sales += 1
+                        else:
+                            invalid_sales += 1
 
-                    self.logger.info(f"Актуальных продаж: {len(sales)}")
+                    self.logger.info(f"📈 Актуальных продаж: {len(sales)}")
+                    if invalid_sales > 0:
+                        self.logger.warning(f"⚠️  Отфильтровано невалидных записей: {invalid_sales}")
 
                     # Группируем по vendor_code для лога
                     sales_by_vendor = defaultdict(int)
                     for sale in sales:
                         sales_by_vendor[sale.vendor_code] += 1
 
-                    for vendor, count in sales_by_vendor.items():
-                        self.logger.info(f"  {vendor}: {count} продаж")
+                    if sales_by_vendor:
+                        self.logger.info("📋 Распределение продаж по артикулам:")
+                        for vendor, count in sorted(sales_by_vendor.items(), key=lambda x: x[1], reverse=True):
+                            self.logger.info(f"   • {vendor}: {count} продаж")
+                    else:
+                        self.logger.warning("⚠️  Нет продаж для обработки")
 
                     return sales
                 else:
                     text = await resp.text()
-                    self.logger.error(f"Ошибка API WB: {resp.status} - {text[:200]}")
+                    self.logger.error(f"❌ Ошибка API WB: {resp.status}")
+                    self.logger.error(f"   Ответ сервера: {text[:200]}")
                     return []
 
         except Exception as e:
-            self.logger.error(f"Ошибка при запросе к WB API: {e}")
+            self.logger.error(f"❌ Ошибка при запросе к WB API: {e}")
             raise
 
     @retry(
@@ -341,6 +385,10 @@ class PriceUpdater:
     async def get_logistics_by_sa_name(self, sa_names: List[str]) -> Dict[str, float]:
         if not sa_names:
             return {}
+
+        self._log_separator("РАСЧЕТ ЛОГИСТИЧЕСКИХ ЗАТРАТ", "-")
+        self.logger.info(f"📦 Анализируем логистику для {len(sa_names)} артикулов")
+        self.logger.info(f"📅 Период анализа: последние 90 дней")
 
         moscow_tz = pytz.timezone('Europe/Moscow')
         date_from = (datetime.now(moscow_tz) - timedelta(days=90)).strftime("%Y-%m-%d")
@@ -354,6 +402,7 @@ class PriceUpdater:
         page = 1
 
         try:
+            self.logger.info("⏳ Загрузка данных о логистике...")
             while True:
                 params = {
                     "dateFrom": date_from,
@@ -364,27 +413,32 @@ class PriceUpdater:
 
                 async with self.session.get(url, headers=headers, params=params) as resp:
                     if resp.status == 204:
+                        self.logger.info("ℹ️  Нет данных о логистике (статус 204)")
                         break
 
                     if resp.status != 200:
+                        self.logger.error(f"❌ Ошибка при получении логистики: {resp.status}")
                         break
 
                     data = await resp.json()
                     all_records.extend(data)
+                    self.logger.info(f"📥 Страница {page}: получено {len(data)} записей")
 
                     if not data:
+                        self.logger.info("✅ Загрузка логистики завершена")
                         break
 
                     last_record = data[-1]
                     next_rrdid = last_record.get('rrd_id') or last_record.get('rrdId') or 0
                     if next_rrdid == 0:
+                        self.logger.info("✅ Все данные загружены")
                         break
 
                     page += 1
                     await asyncio.sleep(0.2)
 
         except Exception as e:
-            self.logger.error(f"Ошибка загрузки: {e}")
+            self.logger.error(f"❌ Ошибка загрузки данных о логистике: {e}")
             return {}
 
         sorted_records = sorted(all_records,
@@ -393,6 +447,8 @@ class PriceUpdater:
 
         last_logistics = {}
         processed_sa_names = set()
+
+        self.logger.info("🔍 Поиск актуальных затрат на логистику...")
 
         for record in sorted_records:
             sa_name = record.get('sa_name')
@@ -413,42 +469,60 @@ class PriceUpdater:
             if is_main_logistics:
                 last_logistics[sa_name] = delivery_rub
                 processed_sa_names.add(sa_name)
+                self.logger.info(f"   • {sa_name}: {delivery_rub:.2f}₽")
 
                 if len(last_logistics) >= len(sa_names):
                     break
 
+        found_count = len(last_logistics)
+        missing_count = len(sa_names) - found_count
+
+        self.logger.info(f"📊 Результаты поиска логистики:")
+        self.logger.info(f"   ✅ Найдено: {found_count} артикулов")
+        if missing_count > 0:
+            self.logger.warning(f"   ⚠️  Не найдено: {missing_count} артикулов")
+            missing_items = [name for name in sa_names if name not in processed_sa_names]
+            for missing in missing_items[:5]:  # Показываем только первые 5
+                self.logger.warning(f"      - {missing}")
+            if len(missing_items) > 5:
+                self.logger.warning(f"      ... и еще {len(missing_items) - 5}")
+
         return last_logistics
 
     def _get_last_non_zero_spp(self, sales: List[SaleData]) -> float:
-        """
-        Рассчитывает среднее значение СПП из всех продаж с положительным СПП
-        """
         try:
-            # Отфильтровываем только продажи с положительным СПП
             spp_sales = [sale for sale in sales if sale.spp_percent > 0]
 
             if not spp_sales:
-                self.logger.debug(f"Нет продаж с положительным СПП, возвращаем 0%")
+                self.logger.debug(f"📉 Нет продаж с положительным СПП, используем 0%")
                 return 0.0
 
-            # Вычисляем среднее значение СПП
             avg_spp = sum(sale.spp_percent for sale in spp_sales) / len(spp_sales)
-
-            self.logger.debug(f"Средний СПП: {avg_spp:.2f}% на основе {len(spp_sales)} продаж")
+            self.logger.info(f"📊 Средний СПП: {avg_spp:.2f}% (на основе {len(spp_sales)} продаж)")
             return avg_spp
 
         except Exception as e:
-            self.logger.warning(f"Ошибка при расчете среднего СПП: {e}. Возвращаем 0%")
+            self.logger.warning(f"⚠️  Ошибка при расчете среднего СПП: {e}. Используем 0%")
             return 0.0
 
     async def fetch_products_batch(self, vendor_codes: List[str]) -> Dict[str, ProductData]:
         if not vendor_codes:
             return {}
 
+        self._log_separator("ЗАГРУЗКА ТОВАРОВ ИЗ БАЗЫ ДАННЫХ", "-")
+        self.logger.info(f"🛒 Загружаем информацию о {len(vendor_codes)} товарах")
+
         product_map = {}
+        loaded_count = 0
+        skipped_count = 0
 
         for i in range(0, len(vendor_codes), Config.BATCH_SIZE):
             batch = vendor_codes[i:i + Config.BATCH_SIZE]
+            batch_num = i // Config.BATCH_SIZE + 1
+            total_batches = (len(vendor_codes) + Config.BATCH_SIZE - 1) // Config.BATCH_SIZE
+
+            self.logger.info(f"📦 Батч {batch_num}/{total_batches}: {len(batch)} товаров")
+
             placeholders = ', '.join(['%s'] * len(batch))
 
             try:
@@ -465,20 +539,32 @@ class PriceUpdater:
                         """, batch)
 
                         rows = await cursor.fetchall()
-                        self.logger.info(f"Загружено {len(rows)} товаров из БД")
 
                         for row in rows:
                             product = ProductData.from_db_row(row)
                             if product:
                                 product_map[product.vendor_code] = product
-                                self.logger.debug(f"Товар {product.vendor_code}: "
-                                                  f"закуп={product.purchase_price:.0f}₽, "
-                                                  f"цель={product.target_profit:.0f}₽, "
-                                                  f"текущая_цена={product.current_price_wb:.0f}₽")
+                                loaded_count += 1
+                            else:
+                                skipped_count += 1
+
+                        self.logger.info(f"   ✓ Загружено: {len(rows)} записей")
 
             except Exception as e:
-                self.logger.error(f"Ошибка загрузки батча: {e}")
+                self.logger.error(f"❌ Ошибка загрузки батча {batch_num}: {e}")
                 continue
+
+        # Логируем результаты загрузки
+        self._log_separator("РЕЗУЛЬТАТЫ ЗАГРУЗКИ ТОВАРОВ", "-")
+        self.logger.info(f"✅ Успешно загружено: {loaded_count} товаров")
+        self.logger.info(f"⚠️  Пропущено (нет в БД/неактивны): {skipped_count}")
+
+        if loaded_count > 0:
+            self.logger.info("📋 Примеры загруженных товаров:")
+            sample_items = list(product_map.items())[:3]  # Показываем первые 3
+            for vendor_code, product in sample_items:
+                self.logger.info(f"   • {vendor_code}: закуп={product.purchase_price:.0f}₽, "
+                                 f"цель={product.target_profit:.0f}₽, цена={product.current_price_wb:.0f}₽")
 
         return product_map
 
@@ -488,6 +574,8 @@ class PriceUpdater:
         retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError))
     )
     async def fetch_nm_id(self, vendor_code: str) -> int:
+        self.logger.info(f"🔍 Поиск nmID для артикула: {vendor_code}")
+
         url = "https://content-api.wildberries.ru/content/v2/get/cards/list"
         headers = {
             "Authorization": Config.WB_CONTENT_TOKEN,
@@ -512,11 +600,14 @@ class PriceUpdater:
                     try:
                         data = json.loads(response_text)
                     except json.JSONDecodeError:
-                        self.logger.error(f"API вернул невалидный JSON: {response_text[:200]}")
+                        self.logger.error(f"❌ API вернул невалидный JSON")
                         return 0
 
                     cards = data.get("cards", [])
+                    self.logger.info(f"📋 Найдено карточек: {len(cards)}")
+
                     if not cards:
+                        self.logger.warning(f"⚠️  Не найдено карточек для {vendor_code}")
                         return 0
 
                     for card in cards:
@@ -524,22 +615,24 @@ class PriceUpdater:
                         if card_vendor_code == str(vendor_code).strip():
                             nm_id = card.get("nmID", 0)
                             if nm_id:
+                                self.logger.info(f"✅ Найден nmID: {nm_id} для {vendor_code}")
                                 return nm_id
 
+                    self.logger.warning(f"⚠️  Не найден nmID для артикула {vendor_code} в ответе API")
                     return 0
 
                 elif resp.status == 401:
-                    self.logger.error("Ошибка авторизации: неверный токен Content API")
+                    self.logger.error("❌ Ошибка авторизации: неверный токен Content API")
                     return 0
                 else:
-                    self.logger.error(f"Ошибка API: {resp.status}. Ответ: {response_text[:500]}")
+                    self.logger.error(f"❌ Ошибка API: {resp.status}")
                     return 0
 
         except asyncio.TimeoutError:
-            self.logger.error(f"Таймаут при поиске '{vendor_code}'")
+            self.logger.error(f"⏰ Таймаут при поиске nmID для '{vendor_code}'")
             return 0
         except Exception as e:
-            self.logger.error(f"Ошибка при поиске '{vendor_code}': {str(e)}")
+            self.logger.error(f"❌ Ошибка при поиске nmID для '{vendor_code}': {str(e)}")
             return 0
 
     @retry(
@@ -548,12 +641,11 @@ class PriceUpdater:
         retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError))
     )
     async def get_wb_discounts(self, nm_ids: List[int]) -> Dict[int, Dict[str, float]]:
-        """
-        Получает скидки товаров из API Wildberries
-        Возвращает словарь: {nm_id: {"discount": float, "club_discount": float}}
-        """
         if not nm_ids:
             return {}
+
+        self._log_separator("ПОЛУЧЕНИЕ АКТУАЛЬНЫХ СКИДОК С WB", "-")
+        self.logger.info(f"🎯 Запрашиваем скидки для {len(nm_ids)} товаров")
 
         results = {}
         url = "https://discounts-prices-api.wildberries.ru/api/v2/list/goods/filter"
@@ -562,8 +654,12 @@ class PriceUpdater:
             "Content-Type": "application/json"
         }
 
-        # API принимает только один nm_id за запрос, так что обрабатываем по одному
-        for nm_id in nm_ids:
+        success_count = 0
+        error_count = 0
+
+        for i, nm_id in enumerate(nm_ids, 1):
+            self.logger.info(f"📊 Товар {i}/{len(nm_ids)}: nmID {nm_id}")
+
             try:
                 params = {
                     "limit": 1,
@@ -580,8 +676,6 @@ class PriceUpdater:
 
                             discount = float(goods_info.get("discount", 0))
                             club_discount = float(goods_info.get("clubDiscount", 0))
-
-                            # Используем обычную скидку или клубную, если она есть
                             effective_discount = club_discount if club_discount > 0 else discount
 
                             results[nm_id] = {
@@ -590,27 +684,32 @@ class PriceUpdater:
                                 "effective_discount": effective_discount
                             }
 
-                            self.logger.debug(f"Получены скидки для nmID {nm_id}: "
-                                              f"обычная={discount}%, клубная={club_discount}%, "
-                                              f"используем={effective_discount}%")
+                            self.logger.info(f"   ✅ Скидки: обычная={discount}%, "
+                                             f"клубная={club_discount}%, используем={effective_discount}%")
+                            success_count += 1
                         else:
-                            self.logger.warning(f"Не удалось получить скидки для nmID {nm_id}: "
+                            self.logger.warning(f"   ⚠️  Не удалось получить скидки: "
                                                 f"{data.get('errorText', 'Unknown error')}")
                             results[nm_id] = {"effective_discount": 0}
+                            error_count += 1
 
                     else:
                         text = await resp.text()
-                        self.logger.warning(f"Ошибка API при получении скидок для nmID {nm_id}: "
-                                            f"{resp.status} - {text[:200]}")
+                        self.logger.warning(f"   ⚠️  Ошибка API: {resp.status}")
                         results[nm_id] = {"effective_discount": 0}
+                        error_count += 1
 
-                    # Соблюдаем лимиты API (не более 5 запросов в 600 мс)
                     await asyncio.sleep(0.15)
 
             except Exception as e:
-                self.logger.error(f"Ошибка при получении скидки для nmID {nm_id}: {e}")
+                self.logger.error(f"   ❌ Ошибка: {e}")
                 results[nm_id] = {"effective_discount": 0}
+                error_count += 1
                 await asyncio.sleep(0.5)
+
+        self._log_separator("ИТОГИ ПОЛУЧЕНИЯ СКИДОК", "-")
+        self.logger.info(f"✅ Успешно: {success_count}")
+        self.logger.info(f"⚠️  С ошибками: {error_count}")
 
         return results
 
@@ -619,18 +718,41 @@ class PriceUpdater:
                                         product: ProductData,
                                         logistics_cost: float) -> PriceUpdate:
         try:
-            self.logger.info(f"=== НАЧАЛО РАСЧЕТА ДЛЯ {vendor_code} ===")
-            self.logger.info(f"Получено продаж: {len(sales)}")
+            self._log_separator(f"АНАЛИЗ ТОВАРА: {vendor_code}", "=")
+
+            self.logger.info(f"📊 ИСХОДНЫЕ ДАННЫЕ:")
+            self._log_table("ПАРАМЕТРЫ ТОВАРА", {
+                "Артикул": vendor_code,
+                "Закупочная цена": f"{product.purchase_price:.2f}₽",
+                "Целевая прибыль": f"{product.target_profit:.2f}₽",
+                "Текущая цена WB": f"{product.current_price_wb:.2f}₽",
+                "Логистика": f"{logistics_cost:.2f}₽",
+                "nmID": product.sku_wb if product.sku_wb else "не установлен"
+            })
+
+            self.logger.info(f"📈 ДАННЫЕ О ПРОДАЖАХ:")
+            self.logger.info(f"   Всего продаж: {len(sales)}")
+            self.logger.info(f"   Требуется для расчета: {Config.MIN_SALES_FOR_CALC}")
 
             # Логируем детали каждой продажи
-            for i, sale in enumerate(sales, 1):
-                self.logger.debug(f"Продажа #{i}: "
-                                  f"total={sale.total_price:.0f}₽, "
-                                  f"discount={sale.discount_percent}%, "
-                                  f"spp={sale.spp_percent}%, "
-                                  f"priceWithDisc={sale.price_with_desc:.0f}₽, "
-                                  f"forPay={sale.for_pay:.0f}₽, "
-                                  f"finished={sale.finished_price:.0f}₽")
+            if len(sales) <= 10:  # Логируем подробно если продаж мало
+                self.logger.info("   Детали продаж:")
+                for i, sale in enumerate(sales, 1):
+                    self.logger.info(f"   {i:2d}. totalPrice: {sale.total_price:7.0f}₽ | "
+                                     f"discount: {sale.discount_percent:5.1f}% | "
+                                     f"priceWithDisc: {sale.price_with_desc:7.0f}₽ | "
+                                     f"forPay: {sale.for_pay:7.0f}₽")
+            else:
+                # Для большого количества продаж логируем статистику
+                price_stats = {
+                    "min": min(s.price_with_desc for s in sales),
+                    "max": max(s.price_with_desc for s in sales),
+                    "avg": statistics.mean(s.price_with_desc for s in sales)
+                }
+                self.logger.info(f"   Статистика priceWithDisc: "
+                                 f"мин={price_stats['min']:.0f}₽, "
+                                 f"макс={price_stats['max']:.0f}₽, "
+                                 f"сред={price_stats['avg']:.0f}₽")
 
             valid_sales = []
             for sale in sales:
@@ -639,9 +761,13 @@ class PriceUpdater:
                         sale.for_pay > 0):
                     valid_sales.append(sale)
 
-            self.logger.info(f"Валидных продаж: {len(valid_sales)} (требуется: {Config.MIN_SALES_FOR_CALC})")
+            self.logger.info(f"✅ Валидных продаж: {len(valid_sales)}")
 
             if len(valid_sales) < Config.MIN_SALES_FOR_CALC:
+                self._log_separator("РЕШЕНИЕ: ПРОПУСК", "!")
+                self.logger.warning(f"⚠️  НЕДОСТАТОЧНО ДАННЫХ")
+                self.logger.warning(f"   Требуется: {Config.MIN_SALES_FOR_CALC}, имеется: {len(valid_sales)}")
+
                 await self.db_logger.log(
                     level="WARNING",
                     message=f"Недостаточно данных для расчета",
@@ -661,9 +787,12 @@ class PriceUpdater:
                     finished_price=0
                 )
 
+            # Получение или поиск nmID
             if product.sku_wb == 0:
+                self.logger.info("🔍 Поиск nmID...")
                 new_nm_id = await self.fetch_nm_id(vendor_code)
                 if new_nm_id == 0:
+                    self.logger.error("❌ Не удалось получить nmID")
                     await self.db_logger.log(
                         level="ERROR",
                         message=f"Не удалось получить nmID",
@@ -683,30 +812,58 @@ class PriceUpdater:
                     )
                 await self.save_nm_id_to_db(vendor_code, new_nm_id)
                 product.sku_wb = new_nm_id
+                self.logger.info(f"✅ nmID сохранен: {new_nm_id}")
 
-            # ПОЛУЧАЕМ СКИДКИ ИЗ API WB ВМЕСТО ИЗ ПРОДАЖ
-            discounts_info = await self.get_wb_discounts([product.sku_wb])
-            api_discount = discounts_info.get(product.sku_wb, {}).get("effective_discount", 0)
+            self.logger.info("🎯 РАСЧЕТ СКИДКИ ИЗ ПРОДАЖ:")
 
-            self.logger.info(f"Скидка из API WB для nmID {product.sku_wb}: {api_discount}%")
+            # Собираем все скидки из валидных продаж
+            discount_list = [sale.discount_percent for sale in valid_sales if sale.discount_percent > 0]
 
-            # Если скидка из API равна 0, пробуем использовать медианную скидку из продаж как запасной вариант
-            if api_discount == 0 and valid_sales:
-                discount_list = [sale.discount_percent for sale in valid_sales if sale.discount_percent > 0]
-                if discount_list:
-                    api_discount = statistics.median(discount_list)
-                    self.logger.info(f"Используем медианную скидку из продаж: {api_discount}%")
+            if discount_list:
+                # Используем медиану для устойчивости к выбросам
+                median_discount = statistics.median(discount_list)
 
-            # Если все равно 0, устанавливаем минимальную скидку
-            if api_discount == 0:
-                api_discount = 0.1  # Минимальная скидка 0.1%
-                self.logger.info(f"Устанавливаем минимальную скидку: {api_discount}%")
+                # Логируем статистику скидок
+                min_discount = min(discount_list)
+                max_discount = max(discount_list)
+                mean_discount = statistics.mean(discount_list)
+
+                self._log_table("СТАТИСТИКА СКИДОК ИЗ ПРОДАЖ", {
+                    "Всего значений": len(discount_list),
+                    "Мин. скидка": f"{min_discount:.1f}%",
+                    "Макс. скидка": f"{max_discount:.1f}%",
+                    "Средняя скидка": f"{mean_discount:.1f}%",
+                    "Медианная скидка": f"{median_discount:.1f}%"
+                })
+
+                # Используем медианную скидку
+                api_discount = median_discount
+                self.logger.info(f"✅ Используем медианную скидку: {api_discount:.1f}%")
+            else:
+                # Если нет данных о скидках в продажах
+                self.logger.warning("⚠️  В продажах нет данных о скидках")
+
+                # Попробуем получить из API как fallback
+                discounts_info = await self.get_wb_discounts([product.sku_wb])
+                api_discount = discounts_info.get(product.sku_wb, {}).get("effective_discount", 0)
+
+                if api_discount > 0:
+                    self.logger.info(f"✅ Используем скидку из API: {api_discount:.1f}%")
+                else:
+                    api_discount = 0.1  # Минимальная скидка
+                    self.logger.info(f"⚠️  Устанавливаем минимальную скидку: {api_discount:.1f}%")
 
             # Ограничиваем максимальную скидку
             if api_discount >= 100:
                 api_discount = 99.9
+                self.logger.warning(f"⚠️  Скидка скорректирована до максимума: {api_discount:.1f}%")
+            elif api_discount < 0:
+                api_discount = 0.1
+                self.logger.warning(f"⚠️  Скидка скорректирована до минимума: {api_discount:.1f}%")
 
-            # 1. Собираем фактические данные из продаж
+            # Сбор статистики по продажам
+            self.logger.info("📊 АНАЛИЗ ПРОДАЖ:")
+
             price_wd_list = []
             forpay_list = []
             forpay_to_price_ratios = []
@@ -720,61 +877,75 @@ class PriceUpdater:
 
             avg_price_wd = statistics.mean(price_wd_list)
             avg_forpay = statistics.mean(forpay_list)
-
-            # Рассчитываем среднее соотношение forPay к priceWithDisc
             avg_ratio = statistics.mean(forpay_to_price_ratios) if forpay_to_price_ratios else 0.674
 
-            self.logger.info(f"Анализ продаж:")
-            self.logger.info(f"  Средний priceWithDisc: {avg_price_wd:.2f}₽")
-            self.logger.info(f"  Средний forPay: {avg_forpay:.2f}₽")
-            self.logger.info(f"  Соотношение forPay/priceWithDisc: {avg_ratio:.3f}")
-            self.logger.info(f"  (рассчитано на основе {len(forpay_to_price_ratios)} продаж)")
-            self.logger.info(f"Используемая скидка: {api_discount:.1f}%")
-            self.logger.info(f"Логистика: {logistics_cost:.2f}₽")
-            self.logger.info(f"Закупочная цена: {product.purchase_price:.2f}₽")
-            self.logger.info(f"Целевая прибыль: {product.target_profit:.2f}₽")
+            self._log_table("СТАТИСТИКА ПРОДАЖ", {
+                "Средний priceWithDisc": f"{avg_price_wd:.2f}₽",
+                "Средний forPay": f"{avg_forpay:.2f}₽",
+                "Соотношение forPay/priceWithDisc": f"{avg_ratio:.3f}",
+                "Продаж использовано": len(valid_sales),
+                "Скидка Продавца": f"{api_discount:.1f}%"
+            })
 
-            # 2. Рассчитываем ТЕКУЩУЮ прибыль (правильно!)
+            # Расчет текущей прибыли
+            self.logger.info("🧮 РАСЧЕТ ТЕКУЩЕЙ ПРИБЫЛИ:")
+
             bank_commission_current = avg_forpay * Config.BANK_COMMISSION
             current_profit = avg_forpay - logistics_cost - bank_commission_current - product.purchase_price
 
-            self.logger.info(f"Текущая прибыль: {current_profit:.2f}₽")
-            self.logger.info(
-                f"  forPay: {avg_forpay:.2f}₽ - логистика: {logistics_cost:.2f}₽ - банк: {bank_commission_current:.2f}₽ - закуп: {product.purchase_price:.2f}₽")
+            self._log_table("РАСЧЕТ ТЕКУЩЕЙ ПРИБЫЛИ", {
+                "Средний forPay": f"{avg_forpay:.2f}₽",
+                "Логистика": f"-{logistics_cost:.2f}₽",
+                "Банковская комиссия": f"-{bank_commission_current:.2f}₽ ({Config.BANK_COMMISSION * 100}%)",
+                "Закупочная цена": f"-{product.purchase_price:.2f}₽",
+                "ИТОГО ПРИБЫЛЬ": f"{current_profit:.2f}₽"
+            })
 
-            # 3. Рассчитываем ЦЕЛЕВОЙ forPay для прибыли 200₽
+            # Расчет целевого forPay
+            self.logger.info("🎯 РАСЧЕТ ЦЕЛЕВЫХ ПОКАЗАТЕЛЕЙ:")
+
             target_forpay = (product.target_profit + logistics_cost + product.purchase_price) / (
-                        1 - Config.BANK_COMMISSION)
+                    1 - Config.BANK_COMMISSION)
 
-            # Проверка расчета
             bank_commission_target = target_forpay * Config.BANK_COMMISSION
             expected_profit = target_forpay - logistics_cost - bank_commission_target - product.purchase_price
 
-            self.logger.info(f"Для прибыли {product.target_profit}₽ нужен forPay: {target_forpay:.2f}₽")
-            self.logger.info(
-                f"  Проверка: {target_forpay:.2f}₽ - {logistics_cost:.2f}₽ - {bank_commission_target:.2f}₽ - {product.purchase_price:.2f}₽ = {expected_profit:.2f}₽")
+            self._log_table("РАСЧЕТ ДЛЯ ЦЕЛЕВОЙ ПРИБЫЛИ", {
+                "Целевая прибыль": f"{product.target_profit:.2f}₽",
+                "+ Логистика": f"+{logistics_cost:.2f}₽",
+                "+ Закупка": f"+{product.purchase_price:.2f}₽",
+                "Сумма до комиссии": f"{(product.target_profit + logistics_cost + product.purchase_price):.2f}₽",
+                "Банковская комиссия": f"{Config.BANK_COMMISSION * 100}%",
+                "Требуемый forPay": f"{target_forpay:.2f}₽",
+                "Ожидаемая прибыль": f"{expected_profit:.2f}₽"
+            })
 
-            # 4. Рассчитываем НУЖНЫЙ priceWithDisc
+            # Расчет новой цены
+            self.logger.info("💵 РАСЧЕТ НОВОЙ ЦЕНЫ:")
+
             required_price_wd = target_forpay / avg_ratio
-
-            self.logger.info(f"Расчет нужного priceWithDisc:")
-            self.logger.info(f"  target_forpay / avg_ratio")
-            self.logger.info(f"  {target_forpay:.2f} / {avg_ratio:.3f}")
-            self.logger.info(f"  = {required_price_wd:.2f}₽")
-
-            # Устанавливаем новую цену
             new_price_wd = required_price_wd
-
-            # Разница для логирования
             price_wd_diff = new_price_wd - avg_price_wd
-            self.logger.info(f"Корректировка: {avg_price_wd:.0f}₽ → {new_price_wd:.0f}₽ ({price_wd_diff:+.0f}₽)")
 
-            # 5. Проверяем минимальную цену
+            self._log_table("РАСЧЕТ НОВОГО PRICEWITHDISC", {
+                "Требуемый forPay": f"{target_forpay:.2f}₽",
+                "Среднее соотношение": f"{avg_ratio:.3f}",
+                "Нужный priceWithDisc": f"{required_price_wd:.2f}₽",
+                "Текущий priceWithDisc": f"{avg_price_wd:.2f}₽",
+                "Изменение": f"{price_wd_diff:+.2f}₽"
+            })
+
+            # Проверка минимальной цены
             min_price = product.purchase_price * Config.MIN_MARGIN_FACTOR
-            self.logger.info(f"Минимальная цена (×{Config.MIN_MARGIN_FACTOR}): {min_price:.2f}₽")
+            self.logger.info(f"📏 ПРОВЕРКА МИНИМАЛЬНОЙ ЦЕНЫ:")
+            self.logger.info(f"   Минимальная цена: {min_price:.2f}₽ (закупка × {Config.MIN_MARGIN_FACTOR})")
+            self.logger.info(f"   Рассчитанная цена: {new_price_wd:.2f}₽")
 
             if new_price_wd < min_price:
-                self.logger.warning(f"Цена ниже минимальной: {new_price_wd:.0f} < {min_price:.0f}")
+                self.logger.warning(f"⚠️  ЦЕНА НИЖЕ МИНИМАЛЬНОЙ!")
+                self.logger.warning(f"   {new_price_wd:.0f}₽ < {min_price:.0f}₽")
+                self.logger.info(f"   Корректируем до минимальной: {min_price:.2f}₽")
+
                 await self.db_logger.log(
                     level="WARNING",
                     message=f"Цена ниже минимальной",
@@ -787,48 +958,56 @@ class PriceUpdater:
                 )
                 new_price_wd = min_price
                 price_wd_diff = new_price_wd - avg_price_wd
-                self.logger.info(f"Скорректировано до: {new_price_wd:.2f}₽")
 
+            # Расчет СПП
             spp = self._get_last_non_zero_spp(sales)
-
-            # 6. Игнорируем СПП в расчетах прибыли
             finished_price = new_price_wd * (1 - spp / 100)
-            self.logger.info(f"Цена со скидкой (finished_price): {finished_price:.2f}₽")
+            self.logger.info(f"📉 СПП (не учитывается): {spp:.1f}%")
+            self.logger.info(f"   Цена со скидкой СПП: {finished_price:.2f}₽")
 
-            # 7. Расчет полной цены на WB с учетом скидки
+            # Расчет полной цены на WB
             if api_discount >= 100:
                 api_discount = 99.9
 
             new_total_price = new_price_wd / (1 - api_discount / 100)
             new_total_price_rounded = round(new_total_price, 0)
 
-            self.logger.info(f"Расчет полной цены на WB:")
-            self.logger.info(f"  {new_price_wd:.2f} / (1 - {api_discount / 100:.3f})")
-            self.logger.info(f"  = {new_total_price:.2f}₽")
-            self.logger.info(f"  Округлено: {new_total_price_rounded:.0f}₽")
-            self.logger.info(f"Старая цена на WB: {product.current_price_wb:.0f}₽")
-            self.logger.info(f"Изменение цены: {new_total_price_rounded - product.current_price_wb:+.0f}₽")
+            price_change_absolute = new_total_price_rounded - product.current_price_wb
+            price_change_percent = (
+                        price_change_absolute / product.current_price_wb * 100) if product.current_price_wb > 0 else 0
 
-            # 8. Валидация
+            self._log_table("РАСЧЕТ ЦЕНЫ НА WB", {
+                "Новый priceWithDisc": f"{new_price_wd:.2f}₽",
+                "Скидка WB": f"{api_discount:.1f}%",
+                "Цена без скидки": f"{new_total_price:.2f}₽",
+                "Округленная цена": f"{new_total_price_rounded:.0f}₽",
+                "Текущая цена WB": f"{product.current_price_wb:.0f}₽",
+                "Изменение цены": f"{price_change_absolute:+.0f}₽",
+                "Процент изменения": f"{price_change_percent:+.1f}%"
+            })
+
+            # Валидация
+            self.logger.info("✅ ПРОВЕРКА ВАЛИДАЦИИ:")
             validation = self._validate_price_update(
                 vendor_code, product, new_price_wd, new_total_price_rounded, price_wd_diff
             )
+
             if validation:
                 validation.discount = api_discount
                 validation.logistics_cost = logistics_cost
+
+                self._log_separator("РЕШЕНИЕ: НЕ ИЗМЕНЯТЬ ЦЕНУ", "!")
+                self.logger.warning(f"❌ {validation.reason}")
+
                 await self.db_logger.log(
                     level="WARNING",
                     message=f"Валидация не пройдена: {validation.status.value}",
                     vendor_code=vendor_code,
                     details={"status": validation.status.value, "reason": validation.reason}
                 )
-                self.logger.info(f"=== РАСЧЕТ ПРЕРВАН: {validation.reason} ===")
                 return validation
 
-
-
-
-            # 9. Создаем результат
+            # Создание результата
             update = PriceUpdate(
                 vendor_code=vendor_code,
                 new_price_wb=new_total_price_rounded,
@@ -845,10 +1024,25 @@ class PriceUpdater:
                 current_profit=current_profit,
                 target_profit=product.target_profit,
                 sales_count=len(valid_sales),
-                spp_used=spp,  # СПП не учитываем
+                spp_used=spp,
                 purchase_price=product.purchase_price,
                 target_forpay=target_forpay
             )
+
+            # Итоговый отчет
+            self._log_separator("ИТОГОВОЕ РЕШЕНИЕ", "✅")
+            self._log_table("РЕЗУЛЬТАТ РАСЧЕТА", {
+                "Артикул": vendor_code,
+                "Старая цена": f"{product.current_price_wb:.0f}₽",
+                "Новая цена": f"{new_total_price_rounded:.0f}₽",
+                "Изменение цены": f"{price_change_absolute:+.0f}₽ ({price_change_percent:+.1f}%)",
+                "Старая прибыль": f"{current_profit:.0f}₽",
+                "Целевая прибыль": f"{product.target_profit:.0f}₽",
+                "Изменение прибыли": f"{product.target_profit - current_profit:+.0f}₽",
+                "Использовано продаж": len(valid_sales),
+                "Скидка WB": f"{api_discount:.1f}%",
+                "Логистика": f"{logistics_cost:.0f}₽"
+            })
 
             await self.db_logger.log(
                 level="SUCCESS",
@@ -870,16 +1064,10 @@ class PriceUpdater:
                 }
             )
 
-            self.logger.info(f"=== РАСЧЕТ ЗАВЕРШЕН ДЛЯ {vendor_code} ===")
-            self.logger.info(f"Итог: {product.current_price_wb:.0f}₽ → {new_total_price_rounded:.0f}₽")
-            self.logger.info(f"Прибыль: {current_profit:.0f}₽ → {product.target_profit:.0f}₽")
-            self.logger.info(f"priceWithDisc: {avg_price_wd:.0f}₽ → {new_price_wd:.0f}₽")
-            self.logger.info(f"forPay: {avg_forpay:.0f}₽ → {target_forpay:.0f}₽")
-
             return update
 
         except Exception as e:
-            error_msg = f"Ошибка в логике для {vendor_code}: {e}"
+            error_msg = f"❌ КРИТИЧЕСКАЯ ОШИБКА при обработке {vendor_code}: {e}"
             self.logger.error(error_msg)
             self.logger.error(traceback.format_exc())
 
@@ -909,8 +1097,12 @@ class PriceUpdater:
                                new_total_price: float,
                                profit_diff: float) -> Optional[PriceUpdate]:
         min_price = product.purchase_price * Config.MIN_MARGIN_FACTOR
+
+        self.logger.info("📋 ПРОВЕРКА КРИТЕРИЕВ:")
+
+        # 1. Проверка минимальной цены
         if new_price_wd < min_price:
-            self.logger.warning(f"Валидация: Цена ниже минимальной: {new_price_wd:.0f} < {min_price:.0f}")
+            self.logger.error(f"❌ ЦЕНА НИЖЕ МИНИМАЛЬНОЙ: {new_price_wd:.0f}₽ < {min_price:.0f}₽")
             return PriceUpdate(
                 vendor_code=vendor_code,
                 new_price_wb=0,
@@ -928,10 +1120,13 @@ class PriceUpdater:
                 spp_used=0,
                 purchase_price=product.purchase_price
             )
+        else:
+            self.logger.info(f"✅ Минимальная цена: ОК ({new_price_wd:.0f}₽ ≥ {min_price:.0f}₽)")
 
+        # 2. Проверка минимального изменения
         price_change = abs(new_total_price - product.current_price_wb)
         if price_change < Config.MIN_PRICE_CHANGE:
-            self.logger.warning(f"Валидация: Изменение меньше порога: {price_change:.0f} < {Config.MIN_PRICE_CHANGE}")
+            self.logger.error(f"❌ ИЗМЕНЕНИЕ СЛИШКОМ МАЛО: {price_change:.0f}₽ < {Config.MIN_PRICE_CHANGE}₽")
             return PriceUpdate(
                 vendor_code=vendor_code,
                 new_price_wb=0,
@@ -949,12 +1144,15 @@ class PriceUpdater:
                 spp_used=0,
                 purchase_price=product.purchase_price
             )
+        else:
+            self.logger.info(f"✅ Минимальное изменение: ОК ({price_change:.0f}₽ ≥ {Config.MIN_PRICE_CHANGE}₽)")
 
+        # 3. Проверка максимального процентного изменения
         if product.current_price_wb > 0:
             price_change_percent = abs((new_total_price - product.current_price_wb) / product.current_price_wb) * 100
             if price_change_percent > Config.MAX_PRICE_CHANGE_PERCENT:
-                self.logger.warning(
-                    f"Валидация: Изменение превышает лимит: {price_change_percent:.1f}% > {Config.MAX_PRICE_CHANGE_PERCENT}%")
+                self.logger.error(
+                    f"❌ ПРОЦЕНТ ИЗМЕНЕНИЯ СЛИШКОМ ВЕЛИК: {price_change_percent:.1f}% > {Config.MAX_PRICE_CHANGE_PERCENT}%")
                 return PriceUpdate(
                     vendor_code=vendor_code,
                     new_price_wb=0,
@@ -972,7 +1170,11 @@ class PriceUpdater:
                     spp_used=0,
                     purchase_price=product.purchase_price
                 )
+            else:
+                self.logger.info(
+                    f"✅ Максимальный процент изменения: ОК ({price_change_percent:.1f}% ≤ {Config.MAX_PRICE_CHANGE_PERCENT}%)")
 
+        self.logger.info("✅ ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ")
         return None
 
     async def save_nm_id_to_db(self, vendor_code: str, nm_id: int) -> bool:
@@ -985,11 +1187,11 @@ class PriceUpdater:
                         WHERE model = %s
                     """, (nm_id, vendor_code))
 
-                    self.logger.info(f"nmID {nm_id} сохранен в БД для {vendor_code}")
+                    self.logger.info(f"💾 nmID {nm_id} сохранен в БД для {vendor_code}")
                     return True
 
         except Exception as e:
-            self.logger.error(f"Ошибка сохранения nmID для {vendor_code}: {e}")
+            self.logger.error(f"❌ Ошибка сохранения nmID для {vendor_code}: {e}")
             return False
 
     async def save_price_update(self, update: PriceUpdate):
@@ -998,17 +1200,7 @@ class PriceUpdater:
                 async with conn.cursor() as cur:
                     current_time = datetime.now(pytz.timezone('Europe/Moscow'))
 
-                    # ВАЖНО: Рассчитываем ОЖИДАЕМУЮ прибыль с НОВОЙ ценой
-                    # У нас есть target_forpay, который мы рассчитали для новой цены
-                    # Прибыль с новой ценой должна быть target_profit (или близко к ней)
-
-                    # Просто используем target_profit как ожидаемую прибыль
                     expected_profit_after_change = update.target_profit
-
-                    # Или можем пересчитать для точности:
-                    # expected_forpay = update.target_forpay
-                    # expected_bank = expected_forpay * Config.BANK_COMMISSION
-                    # expected_profit_after_change = expected_forpay - update.logistics_cost - expected_bank - update.purchase_price
 
                     await cur.execute("""
                         UPDATE oc_product 
@@ -1065,7 +1257,7 @@ class PriceUpdater:
                         update.reason,
                         update.status.value,
                         current_time,
-                        expected_profit_after_change,  # ← ОЖИДАЕМАЯ прибыль с новой ценой
+                        expected_profit_after_change,
                         update.target_profit,
                         update.sales_count,
                         update.spp_used,
@@ -1076,10 +1268,23 @@ class PriceUpdater:
 
                     self.stats['prices_updated'] += 1
 
-                    # Логируем с правильными значениями
-                    profit_before = update.current_profit  # Прибыль ДО изменения
-                    profit_after = expected_profit_after_change  # Ожидаемая прибыль ПОСЛЕ
+                    profit_before = update.current_profit
+                    profit_after = expected_profit_after_change
                     profit_diff = profit_after - profit_before
+
+                    self._log_separator("СОХРАНЕНИЕ ЦЕНЫ В БД", "💾")
+                    self._log_table("СОХРАНЕННЫЕ ДАННЫЕ", {
+                        "Артикул": update.vendor_code,
+                        "Старая цена": f"{update.old_price_wb:.0f}₽",
+                        "Новая цена": f"{update.new_price_wb:.0f}₽",
+                        "Изменение": f"{update.new_price_wb - update.old_price_wb:+.0f}₽",
+                        "Прибыль до": f"{profit_before:.0f}₽",
+                        "Ожидаемая прибыль после": f"{profit_after:.0f}₽",
+                        "Изменение прибыли": f"{profit_diff:+.0f}₽",
+                        "Скидка": f"{update.discount or 0:.1f}%",
+                        "Логистика": f"{update.logistics_cost:.0f}₽",
+                        "Продаж использовано": update.sales_count
+                    })
 
                     await self.db_logger.log(
                         level="SUCCESS",
@@ -1099,13 +1304,8 @@ class PriceUpdater:
                         }
                     )
 
-                    self.logger.info(f"Цена и детальная история обновлены: {update.vendor_code}")
-                    self.logger.info(f"Прибыль до изменения: {profit_before:.0f}₽")
-                    self.logger.info(f"Ожидаемая прибыль после изменения: {profit_after:.0f}₽")
-                    self.logger.info(f"Изменение прибыли: {profit_diff:+.0f}₽")
-
         except Exception as e:
-            error_msg = f"Ошибка сохранения цены для {update.vendor_code}: {e}"
+            error_msg = f"❌ Ошибка сохранения цены для {update.vendor_code}: {e}"
             self.logger.error(error_msg)
 
             await self.db_logger.log(
@@ -1118,6 +1318,7 @@ class PriceUpdater:
                     "cycle_id": self.current_cycle
                 }
             )
+
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=4, max=10),
@@ -1134,8 +1335,11 @@ class PriceUpdater:
                 })
 
         if not data:
-            self.logger.info("Нет данных для отправки на WB")
+            self.logger.info("ℹ️  Нет данных для отправки на WB")
             return
+
+        self._log_separator("ОТПРАВКА ЦЕН НА WILDBERRIES", "🚀")
+        self.logger.info(f"📤 Отправка {len(data)} цен на WB API...")
 
         url = "https://discounts-prices-api.wildberries.ru/api/v2/upload/task"
         headers = {
@@ -1143,14 +1347,24 @@ class PriceUpdater:
             "Content-Type": "application/json"
         }
 
-        self.logger.info(f"Отправка {len(data)} цен на WB API...")
+        # Логируем что отправляем
+        self.logger.info("📋 Отправляемые данные:")
+        for item in data[:5]:  # Показываем первые 5
+            self.logger.info(f"   • nmID: {item['nmID']}, цена: {item['price']}₽, скидка: {item['discount']}%")
+        if len(data) > 5:
+            self.logger.info(f"   ... и еще {len(data) - 5} товаров")
 
         try:
             async with self.session.post(url, headers=headers, json={"data": data}) as resp:
                 if resp.status == 200:
                     res = await resp.json()
                     task_id = res.get('data', {}).get('id')
-                    self.logger.info(f"Цены отправлены на WB: ID задачи={task_id}")
+
+                    self._log_separator("УСПЕШНАЯ ОТПРАВКА", "✅")
+                    self.logger.info(f"✅ Цены успешно отправлены на Wildberries")
+                    self.logger.info(f"📝 ID задачи: {task_id}")
+                    self.logger.info(f"📊 Количество товаров: {len(data)}")
+
                     self.stats['prices_uploaded_to_wb'] = len(data)
 
                     await self.db_logger.log(
@@ -1164,8 +1378,9 @@ class PriceUpdater:
                     )
                 else:
                     text = await resp.text()
-                    error_msg = f"Ошибка отправки цен на WB: {resp.status} - {text[:200]}"
+                    error_msg = f"❌ Ошибка отправки цен на WB: {resp.status}"
                     self.logger.error(error_msg)
+                    self.logger.error(f"   Ответ сервера: {text[:200]}")
 
                     await self.db_logger.log(
                         level="ERROR",
@@ -1177,7 +1392,7 @@ class PriceUpdater:
                         }
                     )
         except Exception as e:
-            error_msg = f"Ошибка при отправке цен на WB: {e}"
+            error_msg = f"❌ Ошибка при отправке цен на WB: {e}"
             self.logger.error(error_msg)
 
             await self.db_logger.log(
@@ -1191,6 +1406,8 @@ class PriceUpdater:
 
     async def worker(self, worker_id: int):
         try:
+            self.logger.info(f"👷 Воркер #{worker_id} запущен")
+
             while self.is_running:
                 try:
                     vendor_code, sales, product, logistics_cost = await asyncio.wait_for(
@@ -1198,11 +1415,16 @@ class PriceUpdater:
                         timeout=1.0
                     )
 
+                    self.logger.info(f"👷 Воркер #{worker_id} обрабатывает: {vendor_code}")
+
                     update = await self.process_product_new_logic(vendor_code, sales, product, logistics_cost)
 
                     if update.status == ProcessingStatus.SUCCESS:
                         await self.save_price_update(update)
                         self.successful_updates.append(update)
+                        self.logger.info(f"👷 Воркер #{worker_id}: {vendor_code} - УСПЕХ")
+                    else:
+                        self.logger.info(f"👷 Воркер #{worker_id}: {vendor_code} - {update.status.value}")
 
                     self.stats[update.status.value] += 1
                     self.queue.task_done()
@@ -1210,7 +1432,7 @@ class PriceUpdater:
                 except asyncio.TimeoutError:
                     continue
                 except Exception as e:
-                    self.logger.error(f"Ошибка в воркере {worker_id}: {e}")
+                    self.logger.error(f"❌ Ошибка в воркере {worker_id}: {e}")
                     await self.db_logger.log(
                         level="ERROR",
                         message=f"Ошибка в воркере",
@@ -1222,9 +1444,10 @@ class PriceUpdater:
                     )
 
         except asyncio.CancelledError:
-            self.logger.info(f"Воркер {worker_id} остановлен")
+            self.logger.info(f"👷 Воркер {worker_id} остановлен")
 
     async def run_cycle(self):
+        self._log_separator(f"ЦИКЛ #{self.current_cycle + 1}", "🔄")
         cycle_start = datetime.now()
         self.current_cycle += 1
 
@@ -1240,11 +1463,12 @@ class PriceUpdater:
         self.successful_updates = []
 
         try:
-            self.logger.info("Получение данных о продажах...")
+            # 1. Получение продаж
             sales_data = await self.fetch_wb_sales()
 
             if not sales_data:
-                self.logger.warning("Нет данных о продажах")
+                self._log_separator("ЦИКЛ ПРЕРВАН", "⚠️")
+                self.logger.warning("⚠️  Нет данных о продажах")
                 await self.db_logger.log(
                     level="WARNING",
                     message="Нет данных о продажах",
@@ -1252,33 +1476,36 @@ class PriceUpdater:
                 )
                 return
 
+            # 2. Подготовка данных
             sa_names_from_sales = []
             for sale in sales_data:
                 if sale.vendor_code and sale.vendor_code not in sa_names_from_sales:
                     sa_names_from_sales.append(sale.vendor_code)
 
-            self.logger.info(f"Найдено {len(sa_names_from_sales)} уникальных vendor_code в продажах")
-            self.logger.info(f"Vendor codes: {sa_names_from_sales}")
+            self.logger.info(f"📊 Найдено {len(sa_names_from_sales)} уникальных артикулов в продажах")
 
+            # 3. Расчет логистики
             logistics_by_sa_name = await self.get_logistics_by_sa_name(sa_names_from_sales)
 
+            # 4. Группировка продаж
             sales_by_vendor = defaultdict(list)
             for sale in sales_data:
                 if sale.vendor_code:
                     sales_by_vendor[sale.vendor_code].append(sale)
 
             vendor_codes = list(sales_by_vendor.keys())
-            self.logger.info(f"Найдено {len(vendor_codes)} артикулов с продажами")
 
-            for vendor, sales_list in sales_by_vendor.items():
-                self.logger.info(f"  {vendor}: {len(sales_list)} продаж, "
-                                 f"логистика: {logistics_by_sa_name.get(vendor, 0):.2f}₽")
+            self._log_table("ОБНАРУЖЕННЫЕ АРТИКУЛЫ", {
+                "Всего артикулов с продажами": len(vendor_codes),
+                "Артикулов с логистикой": len(logistics_by_sa_name)
+            })
 
+            # 5. Загрузка товаров из БД
             product_map = await self.fetch_products_batch(vendor_codes)
-            self.logger.info(f"Загружено {len(product_map)} товаров из БД")
 
             if not product_map:
-                self.logger.warning("Нет товаров для обработки")
+                self._log_separator("ЦИКЛ ПРЕРВАН", "⚠️")
+                self.logger.warning("⚠️  Нет товаров для обработки")
                 await self.db_logger.log(
                     level="WARNING",
                     message="Нет товаров для обработки в БД",
@@ -1286,7 +1513,11 @@ class PriceUpdater:
                 )
                 return
 
+            # 6. Добавление задач в очередь
             queue_tasks = 0
+            skipped_tasks = 0
+
+            self._log_separator("ФОРМИРОВАНИЕ ОЧЕРЕДИ ЗАДАЧ", "📋")
 
             for vendor_code in vendor_codes:
                 if vendor_code in product_map:
@@ -1298,46 +1529,72 @@ class PriceUpdater:
                                           product,
                                           logistics_cost))
                     queue_tasks += 1
-                    self.logger.info(f"В очередь добавлен {vendor_code}: "
-                                     f"{len(sales_by_vendor[vendor_code])} продаж, "
-                                     f"логистика {logistics_cost:.2f}₽")
 
-            self.logger.info(f"В очередь добавлено {queue_tasks} задач")
+                    if queue_tasks <= 5:  # Показываем первые 5 задач
+                        self.logger.info(f"📥 Добавлен: {vendor_code} "
+                                         f"({len(sales_by_vendor[vendor_code])} продаж, "
+                                         f"логистика {logistics_cost:.0f}₽)")
+                else:
+                    skipped_tasks += 1
+
+            self.logger.info(f"📊 В очередь добавлено: {queue_tasks} задач")
+            if skipped_tasks > 0:
+                self.logger.info(f"📊 Пропущено (нет в БД): {skipped_tasks} артикулов")
+
+            # 7. Запуск воркеров
+            self._log_separator("ЗАПУСК ОБРАБОТКИ", "⚡")
+            self.logger.info(f"👥 Запускаем {Config.WORKERS_COUNT} воркеров...")
 
             workers = []
             for i in range(Config.WORKERS_COUNT):
                 worker_task = asyncio.create_task(self.worker(i))
                 workers.append(worker_task)
 
+            # 8. Ожидание завершения
+            self.logger.info("⏳ Ожидание завершения обработки...")
             await self.queue.join()
 
+            # 9. Остановка воркеров
             for worker_task in workers:
                 worker_task.cancel()
 
             await asyncio.gather(*workers, return_exceptions=True)
+            self.logger.info("✅ Обработка завершена")
 
+            # 10. Отправка цен на WB (если включено)
             if LOAD_PRICE_TO_WB and self.successful_updates:
-                self.logger.info("Отправка обновлений цен на WB...")
                 await self.upload_prices_to_wb(self.successful_updates)
             else:
-                self.logger.info("Отправка цен на WB отключена (LOAD_PRICE_TO_WB=False)")
+                self.logger.info("ℹ️  Отправка цен на WB отключена (LOAD_PRICE_TO_WB=False)")
 
+            # 11. Статистика цикла
             cycle_end = datetime.now()
             duration = (cycle_end - cycle_start).total_seconds()
 
-            self.logger.info("=" * 80)
-            self.logger.info("СТАТИСТИКА ЦИКЛА:")
-            self.logger.info(f"   Всего артикулов: {len(vendor_codes)}")
-            self.logger.info(f"   Товаров в БД: {len(product_map)}")
-            self.logger.info(f"   Успешно обработано: {self.stats.get('success', 0)}")
-            self.logger.info(f"   Обновлено цен: {self.stats.get('prices_updated', 0)}")
-            self.logger.info(f"   Отправлено на WB: {self.stats.get('prices_uploaded_to_wb', 0)}")
-            self.logger.info(f"   Пропущено (мало данных): {self.stats.get('skipped_no_data', 0)}")
-            self.logger.info(f"   Пропущено (низкая цена): {self.stats.get('skipped_min_price', 0)}")
-            self.logger.info(f"   Пропущено (мало изменений): {self.stats.get('skipped_min_change', 0)}")
-            self.logger.info(f"   Ошибок: {self.stats.get('error', 0)}")
-            self.logger.info(f"   Время выполнения: {duration:.2f} сек")
-            self.logger.info("=" * 80)
+            self._log_separator("СТАТИСТИКА ЦИКЛА", "📊")
+            self._log_table("РЕЗУЛЬТАТЫ ОБРАБОТКИ", {
+                "Время выполнения": f"{duration:.1f} сек",
+                "Всего артикулов": len(vendor_codes),
+                "Товаров в БД": len(product_map),
+                "✅ Успешно обработано": self.stats.get('success', 0),
+                "✅ Обновлено цен": self.stats.get('prices_updated', 0),
+                "✅ Отправлено на WB": self.stats.get('prices_uploaded_to_wb', 0),
+                "⚠️  Пропущено (мало данных)": self.stats.get('skipped_no_data', 0),
+                "⚠️  Пропущено (низкая цена)": self.stats.get('skipped_min_price', 0),
+                "⚠️  Пропущено (мало изменений)": self.stats.get('skipped_min_change', 0),
+                "❌ Ошибок": self.stats.get('error', 0)
+            })
+
+            # 12. Примеры изменений
+            if self.successful_updates:
+                self._log_separator("ПРИМЕРЫ ИЗМЕНЕНИЙ ЦЕН", "📈")
+                sample_updates = self.successful_updates[:3]  # Показываем первые 3
+                for update in sample_updates:
+                    change = update.new_price_wb - update.old_price_wb
+                    percent = (change / update.old_price_wb * 100) if update.old_price_wb > 0 else 0
+                    self.logger.info(f"   • {update.vendor_code}: "
+                                     f"{update.old_price_wb:.0f}₽ → {update.new_price_wb:.0f}₽ "
+                                     f"({change:+.0f}₽, {percent:+.1f}%)")
 
             await self.db_logger.log(
                 level="INFO",
@@ -1357,7 +1614,7 @@ class PriceUpdater:
             )
 
         except Exception as e:
-            error_msg = f"Критическая ошибка в цикле: {e}"
+            error_msg = f"❌ КРИТИЧЕСКАЯ ОШИБКА в цикле: {e}"
             self.logger.error(error_msg)
             self.logger.error(traceback.format_exc())
 
@@ -1377,20 +1634,24 @@ class PriceUpdater:
 
         while self.is_running:
             cycle_count += 1
-            self.logger.info(f"\n{'#' * 80}")
-            self.logger.info(f"ЦИКЛ #{cycle_count}")
-            self.logger.info(f"{'#' * 80}")
 
             try:
                 await self.run_cycle()
 
                 hours = Config.CYCLE_INTERVAL // 3600
                 minutes = (Config.CYCLE_INTERVAL % 3600) // 60
-                self.logger.info(f"Ожидание следующего цикла ({hours}ч {minutes}мин)...")
+
+                self._log_separator("ОЖИДАНИЕ СЛЕДУЮЩЕГО ЦИКЛА", "⏰")
+                self.logger.info(f"🕒 Следующий цикл через: {hours}ч {minutes}мин")
+                self.logger.info(f"📅 Время следующего запуска: "
+                                 f"{(datetime.now() + timedelta(seconds=Config.CYCLE_INTERVAL)).strftime('%H:%M:%S')}")
+
                 await asyncio.sleep(Config.CYCLE_INTERVAL)
 
             except KeyboardInterrupt:
-                self.logger.info("Остановка по запросу пользователя")
+                self._log_separator("ОСТАНОВКА ПОЛЬЗОВАТЕЛЕМ", "🛑")
+                self.logger.info("Пользователь запросил остановку")
+
                 await self.db_logger.log(
                     level="INFO",
                     message="Остановка по запросу пользователя",
@@ -1398,7 +1659,7 @@ class PriceUpdater:
                 )
                 break
             except Exception as e:
-                error_msg = f"Фатальная ошибка: {e}"
+                error_msg = f"❌ ФАТАЛЬНАЯ ОШИБКА: {e}"
                 self.logger.error(error_msg)
                 self.logger.error(traceback.format_exc())
 
@@ -1413,15 +1674,18 @@ class PriceUpdater:
                 )
 
                 wait_time = min(300 * (2 ** (cycle_count % 5)), 3600)
-                self.logger.info(f"Пауза {wait_time} сек перед повторной попыткой...")
+                self.logger.info(f"⏸️  Пауза {wait_time} сек перед повторной попыткой...")
                 await asyncio.sleep(wait_time)
 
     def _handle_shutdown(self, signum, frame):
         signal_name = {signal.SIGTERM: 'SIGTERM', signal.SIGINT: 'SIGINT'}.get(signum, str(signum))
-        self.logger.info(f"Получен сигнал {signal_name}, завершение...")
+        self._log_separator("ПОЛУЧЕН СИГНАЛ ОСТАНОВКИ", "🚨")
+        self.logger.info(f"Сигнал: {signal_name}")
+        self.logger.info("Завершение работы...")
         self.is_running = False
 
     async def cleanup(self):
+        self._log_separator("ЗАВЕРШЕНИЕ РАБОТЫ", "🔚")
         self.logger.info("Очистка ресурсов...")
 
         await self.db_logger.log(
@@ -1432,14 +1696,15 @@ class PriceUpdater:
 
         if self.session and not self.session.closed:
             await self.session.close()
-            self.logger.info("HTTP сессия закрыта")
+            self.logger.info("✅ HTTP сессия закрыта")
 
         if self.db_pool:
             self.db_pool.close()
             await self.db_pool.wait_closed()
-            self.logger.info("Пул БД закрыт")
+            self.logger.info("✅ Пул БД закрыт")
 
-        self.logger.info("Очистка завершена")
+        self.logger.info("✅ Очистка завершена")
+        self._log_separator("РАБОТА ЗАВЕРШЕНА", "🏁")
 
 
 async def main():
@@ -1449,7 +1714,7 @@ async def main():
         await updater.initialize()
         await updater.run()
     except Exception as e:
-        updater.logger.critical(f"Фатальная ошибка: {e}")
+        updater.logger.critical(f"❌ ФАТАЛЬНАЯ ОШИБКА: {e}")
         updater.logger.critical(traceback.format_exc())
         sys.exit(1)
     finally:
@@ -1465,11 +1730,11 @@ if __name__ == "__main__":
     if not Config.WB_CONTENT_TOKEN:
         missing.append("WB_CONTENT_TOKEN")
     if missing:
-        print(f"ОШИБКА: Не установлены переменные: {', '.join(missing)}")
+        print(f"❌ ОШИБКА: Не установлены переменные: {', '.join(missing)}")
         sys.exit(1)
 
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nПрограмма остановлена пользователем")
+        print("\n🛑 Программа остановлена пользователем")
         sys.exit(0)
