@@ -382,112 +382,173 @@ class PriceUpdater:
         wait=wait_exponential(multiplier=1, min=4, max=10),
         retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError))
     )
-    async def get_logistics_by_sa_name(self, sa_names: List[str]) -> Dict[str, float]:
+    async def get_logistics_by_sa_name_improved(self, sa_names: List[str]) -> Dict[str, float]:
+        """
+        Получение стоимости логистики из последних доступных отчётов.
+        Стратегия: берем данные за 7 дней, находим самую свежую дату с продажами,
+        для каждого артикула используем МЕДИАНУ стоимости за эту дату (устойчива к выбросам).
+        Для артикулов без данных за последний день используется РЕЗЕРВНАЯ СТРАТЕГИЯ
+        (поиск по всему периоду).
+        """
         if not sa_names:
             return {}
 
-        self._log_separator("РАСЧЕТ ЛОГИСТИЧЕСКИХ ЗАТРАТ", "-")
+        self._log_separator("РАСЧЕТ ЛОГИСТИКИ: УЛУЧШЕННЫЙ МЕТОД", "-")
         self.logger.info(f"📦 Анализируем логистику для {len(sa_names)} артикулов")
-        self.logger.info(f"📅 Период анализа: последние 90 дней")
 
         moscow_tz = pytz.timezone('Europe/Moscow')
-        date_from = (datetime.now(moscow_tz) - timedelta(days=90)).strftime("%Y-%m-%d")
         date_to = datetime.now(moscow_tz).strftime("%Y-%m-%d")
+        date_from = (datetime.now(moscow_tz) - timedelta(days=7)).strftime("%Y-%m-%d")
+
+        self.logger.info(f"📅 Запрашиваем период: с {date_from} по {date_to}")
 
         url = "https://statistics-api.wildberries.ru/api/v5/supplier/reportDetailByPeriod"
         headers = {"Authorization": Config.WB_SALES_TOKEN}
+        params = {"dateFrom": date_from, "dateTo": date_to, "limit": 100000, "period": "daily"}
 
-        all_records = []
-        next_rrdid = 0
-        page = 1
+        all_filtered_records = []  # Все подходящие записи за период
 
         try:
-            self.logger.info("⏳ Загрузка данных о логистике...")
-            while True:
-                params = {
-                    "dateFrom": date_from,
-                    "dateTo": date_to,
-                    "rrdid": next_rrdid,
-                    "limit": 100000
-                }
+            async with self.session.get(url, headers=headers, params=params) as resp:
+                if resp.status == 204:
+                    self.logger.warning("📭 Отчёт за период пуст (204 No Content)")
+                    return {}
+                if resp.status != 200:
+                    self.logger.error(f"❌ Ошибка API: {resp.status}")
+                    return {}
+                data = await resp.json()
+                self.logger.info(f"📥 Получено {len(data)} записей за период.")
 
-                async with self.session.get(url, headers=headers, params=params) as resp:
-                    if resp.status == 204:
-                        self.logger.info("ℹ️  Нет данных о логистике (статус 204)")
-                        break
+                # 1. ФИЛЬТРАЦИЯ: обрабатываем все записи, собираем нужные данные
+                for record in data:
+                    sa_name = record.get('sa_name')
+                    # Если артикул не в нашем списке, пропускаем
+                    if not sa_name or sa_name not in sa_names:
+                        continue
 
-                    if resp.status != 200:
-                        self.logger.error(f"❌ Ошибка при получении логистики: {resp.status}")
-                        break
+                    delivery_amount = record.get('delivery_amount', 0)
+                    return_amount = record.get('return_amount', 0)
+                    delivery_rub = record.get('delivery_rub', 0)
+                    rr_dt = record.get('rr_dt', '')  # Дата операции
 
-                    data = await resp.json()
-                    all_records.extend(data)
-                    self.logger.info(f"📥 Страница {page}: получено {len(data)} записей")
+                    try:
+                        # Преобразуем типы, защищаемся от некорректных данных
+                        delivery_amount_int = int(delivery_amount)
+                        delivery_rub_float = float(delivery_rub)
+                        return_amount_int = int(return_amount) if return_amount else 0
+                    except (ValueError, TypeError):
+                        continue  # Пропускаем записи с неконвертируемыми данными
 
-                    if not data:
-                        self.logger.info("✅ Загрузка логистики завершена")
-                        break
+                    # Отбираем только основные доставки (не возвраты) с положительной стоимостью
+                    if delivery_amount_int > 0 and delivery_rub_float > 0 and return_amount_int == 0:
+                        cost_per_unit = delivery_rub_float / delivery_amount_int
+                        date_only = rr_dt[:10] if rr_dt else ''
 
-                    last_record = data[-1]
-                    next_rrdid = last_record.get('rrd_id') or last_record.get('rrdId') or 0
-                    if next_rrdid == 0:
-                        self.logger.info("✅ Все данные загружены")
-                        break
+                        all_filtered_records.append({
+                            'sa_name': sa_name,
+                            'cost_per_unit': cost_per_unit,
+                            'date_only': date_only,
+                            'delivery_amount': delivery_amount_int,
+                            'delivery_rub': delivery_rub_float,
+                            'rr_dt': rr_dt
+                        })
 
-                    page += 1
-                    await asyncio.sleep(0.2)
+                self.logger.info(f"✅ После фильтрации осталось {len(all_filtered_records)} записей с логистикой.")
 
         except Exception as e:
-            self.logger.error(f"❌ Ошибка загрузки данных о логистике: {e}")
+            self.logger.error(f"❌ Критическая ошибка при запросе отчёта: {e}")
             return {}
 
-        sorted_records = sorted(all_records,
-                                key=lambda x: x.get('rr_dt', '') or x.get('create_dt', ''),
-                                reverse=True)
+        # Если после фильтрации данных нет - выходим
+        if not all_filtered_records:
+            self.logger.error("❌ Нет подходящих записей о доставках для анализа.")
+            return {}
 
-        last_logistics = {}
-        processed_sa_names = set()
+        # 2. ОПРЕДЕЛЯЕМ ПОСЛЕДНЮЮ ДАТУ С ДАННЫМИ
+        # Получаем уникальные даты из отфильтрованных записей
+        unique_dates = sorted({rec['date_only'] for rec in all_filtered_records if rec['date_only']}, reverse=True)
 
-        self.logger.info("🔍 Поиск актуальных затрат на логистику...")
+        if not unique_dates:
+            self.logger.error("❌ Не удалось определить даты из записей.")
+            return {}
 
-        for record in sorted_records:
-            sa_name = record.get('sa_name')
+        latest_date = unique_dates[0]
+        self.logger.info(f"🗓️  Самая последняя дата с данными о доставках: {latest_date}")
 
-            if not sa_name or sa_name not in sa_names or sa_name in processed_sa_names:
-                continue
+        # 3. РАСЧЁТ ПО ОСНОВНОЙ СТРАТЕГИИ (Медиана за последний день)
+        logistics_by_article = {}
+        processed_articles = set()
 
-            delivery_amount = record.get('delivery_amount', 0)
-            return_amount = record.get('return_amount', 0)
-            delivery_rub = record.get('delivery_rub', 0)
+        # Группируем записи за последний день по артикулу
+        records_for_latest_date = [r for r in all_filtered_records if r['date_only'] == latest_date]
+        grouped_by_article_latest = defaultdict(list)
+        for rec in records_for_latest_date:
+            grouped_by_article_latest[rec['sa_name']].append(rec['cost_per_unit'])
 
-            is_main_logistics = (
-                    delivery_amount > 0 and
-                    delivery_rub > 0 and
-                    return_amount == 0
-            )
+        for sa_name, costs in grouped_by_article_latest.items():
+            if costs:
+                # Используем МЕДИАНУ - она устойчивее к единичным выбросам, чем максимум
+                median_cost = statistics.median(costs)
+                logistics_by_article[sa_name] = median_cost
+                processed_articles.add(sa_name)
+                # Детальное логирование для первых нескольких артикулов
+                if len(processed_articles) <= 5:
+                    self.logger.info(f"   📊 {sa_name}: {len(costs)} доставок, медиана = {median_cost:.2f}₽ "
+                                     f"(диапазон: {min(costs):.2f} - {max(costs):.2f}₽)")
 
-            if is_main_logistics:
-                last_logistics[sa_name] = delivery_rub
-                processed_sa_names.add(sa_name)
-                self.logger.info(f"   • {sa_name}: {delivery_rub:.2f}₽")
+        # 4. РЕЗЕРВНАЯ СТРАТЕГИЯ (Fallback) для артикулов без данных за последний день
+        missing_articles = set(sa_names) - processed_articles
+        if missing_articles:
+            self.logger.info(f"🔍 Для {len(missing_articles)} артикулов нет данных за {latest_date}. "
+                             f"Применяем резервную стратегию.")
+            # Ищем записи по этим артикулам за ВЕСЬ период (7 дней)
+            backup_records = [r for r in all_filtered_records if r['sa_name'] in missing_articles]
+            grouped_backup = defaultdict(list)
+            for rec in backup_records:
+                grouped_backup[rec['sa_name']].append(rec['cost_per_unit'])
 
-                if len(last_logistics) >= len(sa_names):
-                    break
+            for sa_name in missing_articles:
+                costs = grouped_backup.get(sa_name)
+                if costs:
+                    # Для резервной стратегии тоже используем медиану
+                    median_cost = statistics.median(costs)
+                    logistics_by_article[sa_name] = median_cost
+                    # Находим дату самой последней доставки для этого артикула (для информации)
+                    article_dates = sorted(
+                        {r['date_only'] for r in backup_records if r['sa_name'] == sa_name and r['date_only']},
+                        reverse=True)
+                    last_date_for_article = article_dates[0] if article_dates else "нет данных"
+                    self.logger.info(f"   ↪️  {sa_name}: использованы данные от {last_date_for_article}, "
+                                     f"медиана = {median_cost:.2f}₽ (на основе {len(costs)} доставок)")
+                else:
+                    # Если даже за 7 дней данных нет - артикул остаётся без значения
+                    self.logger.warning(f"   ⚠️  {sa_name}: данных о доставках не найдено за весь период.")
 
-        found_count = len(last_logistics)
-        missing_count = len(sa_names) - found_count
+        # 5. ФИНАЛЬНЫЙ РЕЗУЛЬТАТ И СТАТИСТИКА
+        self._log_separator("ИТОГИ РАСЧЁТА", "=")
+        found_count = len(logistics_by_article)
+        missing_final_count = len(sa_names) - found_count
 
-        self.logger.info(f"📊 Результаты поиска логистики:")
-        self.logger.info(f"   ✅ Найдено: {found_count} артикулов")
-        if missing_count > 0:
-            self.logger.warning(f"   ⚠️  Не найдено: {missing_count} артикулов")
-            missing_items = [name for name in sa_names if name not in processed_sa_names]
-            for missing in missing_items[:5]:  # Показываем только первые 5
-                self.logger.warning(f"      - {missing}")
-            if len(missing_items) > 5:
-                self.logger.warning(f"      ... и еще {len(missing_items) - 5}")
+        self.logger.info(f"📊 Результаты расчёта для отчётного периода {date_from} - {date_to}:")
+        self.logger.info(f"   ✅ Найдена стоимость для: {found_count} артикулов")
+        if missing_final_count > 0:
+            self.logger.warning(f"   ⚠️  Не удалось определить стоимость для: {missing_final_count} артикулов")
 
-        return last_logistics
+        if logistics_by_article:
+            costs = list(logistics_by_article.values())
+            self.logger.info(f"\n📈 Статистика определённых стоимостей логистики (за ед.):")
+            self.logger.info(f"   Мин.    : {min(costs):.2f}₽")
+            self.logger.info(f"   Медиана : {statistics.median(costs):.2f}₽")
+            self.logger.info(f"   Ср.     : {sum(costs) / len(costs):.2f}₽")
+            self.logger.info(f"   Макс.   : {max(costs):.2f}₽")
+
+            # Примеры (топ-5 самых "дорогих" по логистике)
+            sorted_by_cost = sorted(logistics_by_article.items(), key=lambda x: x[1], reverse=True)[:5]
+            self.logger.info(f"\n🏆 Топ-5 артикулов с самой высокой стоимостью логистики:")
+            for idx, (art, cost) in enumerate(sorted_by_cost, 1):
+                self.logger.info(f"   {idx}. {art}: {cost:.2f}₽")
+
+        return logistics_by_article
 
     def _get_last_non_zero_spp(self, sales: List[SaleData]) -> float:
         try:
@@ -720,15 +781,103 @@ class PriceUpdater:
         try:
             self._log_separator(f"АНАЛИЗ ТОВАРА: {vendor_code}", "=")
 
+            # Получаем историю логистики из отчетов WB за последние 7 дней
+            historical_logistics = await self.get_logistics_history_from_reports(vendor_code)
+
+            # Умная стратегия буфера
+            base_buffer_factor = 1.07  # 5% буфер по умолчанию
+            final_buffer_factor = 1.0  # Итоговый коэффициент
+            apply_buffer = True
+            buffer_reason = "стандартный буфер 7%"
+
+            if historical_logistics and len(historical_logistics) >= 2:
+                current_logistics = logistics_cost
+
+                # 1. Если есть данные за несколько дней, анализируем тренд
+                avg_historical = statistics.mean(historical_logistics)
+                max_historical = max(historical_logistics)
+                min_historical = min(historical_logistics)
+
+                self.logger.info(f"📊 ИСТОРИЯ ЛОГИСТИКИ {vendor_code}:")
+                self.logger.info(f"   Текущая: {current_logistics:.0f}₽")
+                self.logger.info(f"   Средняя за период: {avg_historical:.0f}₽")
+                self.logger.info(f"   Максимум: {max_historical:.0f}₽")
+                self.logger.info(f"   Минимум: {min_historical:.0f}₽")
+
+                # Анализ тренда
+                if len(historical_logistics) >= 3:
+                    # Разделяем на две части: старые и новые данные
+                    old_part = historical_logistics[:-2]
+                    new_part = historical_logistics[-2:]
+
+                    avg_old = statistics.mean(old_part)
+                    avg_new = statistics.mean(new_part)
+
+                    # Если тренд роста - увеличиваем буфер
+                    if avg_new > avg_old * 1.10:  # Рост на 10%
+                        base_buffer_factor = 1.08  # 8% буфер
+                        buffer_reason = "тренд роста (8%)"
+                        self.logger.info(f"   📈 Тренд: рост (+{(avg_new / avg_old * 100 - 100):.0f}%)")
+                    # Если тренд снижения - уменьшаем буфер
+                    elif avg_new < avg_old * 0.90:  # Снижение на 10%
+                        base_buffer_factor = 1.02  # 2% буфер
+                        buffer_reason = "тренд снижения (2%)"
+                        self.logger.info(f"   📉 Тренд: снижение ({(avg_new / avg_old * 100 - 100):.0f}%)")
+
+                # 2. Анализ волатильности
+                if len(historical_logistics) >= 3:
+                    stdev = statistics.stdev(historical_logistics) if len(historical_logistics) > 1 else 0
+                    cv = (stdev / avg_historical * 100) if avg_historical > 0 else 0
+
+                    self.logger.info(f"   Волатильность: {cv:.1f}%")
+
+                    # Если высокая волатильность - увеличиваем буфер
+                    if cv > 30:
+                        base_buffer_factor = 1.08
+                        buffer_reason = "высокая волатильность (8%)"
+
+                # 3. Если текущая логистика уже выше средней - увеличиваем буфер
+                if current_logistics > avg_historical * 1.15:
+                    base_buffer_factor = 1.10  # 10% буфер
+                    buffer_reason = "текущая выше средней на 15% (10%)"
+
+                # 4. Если логистика сильно упала - уменьшаем буфер
+                elif current_logistics < avg_historical * 0.85:
+                    base_buffer_factor = 1.02  # 2% буфер
+                    buffer_reason = "сильное снижение (2%)"
+
+                # 5. Если логистика близка к максимуму за период - увеличиваем буфер
+                if current_logistics > max_historical * 0.95:
+                    base_buffer_factor = max(base_buffer_factor, 1.08)
+                    buffer_reason = f"близко к максимуму ({buffer_reason})"
+
+            else:
+                self.logger.info(f"📊 ИСТОРИЯ ЛОГИСТИКИ {vendor_code}: недостаточно данных")
+                buffer_reason = "недостаточно истории, стандартный буфер 5%"
+
+            # Применяем буфер
+            logistics_cost_buffered = logistics_cost * base_buffer_factor
+            final_buffer_factor = base_buffer_factor
+
             self.logger.info(f"📊 ИСХОДНЫЕ ДАННЫЕ:")
-            self._log_table("ПАРАМЕТРЫ ТОВАРА", {
+            logistics_info = {
                 "Артикул": vendor_code,
                 "Закупочная цена": f"{product.purchase_price:.2f}₽",
                 "Целевая прибыль": f"{product.target_profit:.2f}₽",
                 "Текущая цена WB": f"{product.current_price_wb:.2f}₽",
-                "Логистика": f"{logistics_cost:.2f}₽",
+                "Логистика (из отчета)": f"{logistics_cost:.2f}₽",
+                "Логистика (с буфером)": f"{logistics_cost_buffered:.2f}₽",
+                "Коэффициент буфера": f"{final_buffer_factor}",
+                "Причина буфера": buffer_reason,
                 "nmID": product.sku_wb if product.sku_wb else "не установлен"
-            })
+            }
+
+            if historical_logistics:
+                days_count = len(historical_logistics)
+                logistics_info[
+                    f"История ({days_count} дней)"] = f"{min(historical_logistics):.0f}-{max(historical_logistics):.0f}₽"
+
+            self._log_table("ПАРАМЕТРЫ ТОВАРА", logistics_info)
 
             self.logger.info(f"📈 ДАННЫЕ О ПРОДАЖАХ:")
             self.logger.info(f"   Всего продаж: {len(sales)}")
@@ -783,7 +932,7 @@ class PriceUpdater:
                     status=ProcessingStatus.SKIPPED_NO_DATA,
                     error_msg=f"Недостаточно данных: {len(valid_sales)}",
                     sku_wb=product.sku_wb,
-                    logistics_cost=logistics_cost,
+                    logistics_cost=logistics_cost_buffered,
                     finished_price=0
                 )
 
@@ -807,7 +956,7 @@ class PriceUpdater:
                         status=ProcessingStatus.ERROR,
                         error_msg="Не удалось получить nmID",
                         sku_wb=0,
-                        logistics_cost=logistics_cost,
+                        logistics_cost=logistics_cost_buffered,
                         finished_price=0
                     )
                 await self.save_nm_id_to_db(vendor_code, new_nm_id)
@@ -891,11 +1040,11 @@ class PriceUpdater:
             self.logger.info("🧮 РАСЧЕТ ТЕКУЩЕЙ ПРИБЫЛИ:")
 
             bank_commission_current = avg_forpay * Config.BANK_COMMISSION
-            current_profit = avg_forpay - logistics_cost - bank_commission_current - product.purchase_price
+            current_profit = avg_forpay - logistics_cost_buffered - bank_commission_current - product.purchase_price
 
             self._log_table("РАСЧЕТ ТЕКУЩЕЙ ПРИБЫЛИ", {
                 "Средний forPay": f"{avg_forpay:.2f}₽",
-                "Логистика": f"-{logistics_cost:.2f}₽",
+                "Логистика": f"-{logistics_cost_buffered:.2f}₽",
                 "Банковская комиссия": f"-{bank_commission_current:.2f}₽ ({Config.BANK_COMMISSION * 100}%)",
                 "Закупочная цена": f"-{product.purchase_price:.2f}₽",
                 "ИТОГО ПРИБЫЛЬ": f"{current_profit:.2f}₽"
@@ -904,17 +1053,17 @@ class PriceUpdater:
             # Расчет целевого forPay
             self.logger.info("🎯 РАСЧЕТ ЦЕЛЕВЫХ ПОКАЗАТЕЛЕЙ:")
 
-            target_forpay = (product.target_profit + logistics_cost + product.purchase_price) / (
+            target_forpay = (product.target_profit + logistics_cost_buffered + product.purchase_price) / (
                     1 - Config.BANK_COMMISSION)
 
             bank_commission_target = target_forpay * Config.BANK_COMMISSION
-            expected_profit = target_forpay - logistics_cost - bank_commission_target - product.purchase_price
+            expected_profit = target_forpay - logistics_cost_buffered - bank_commission_target - product.purchase_price
 
             self._log_table("РАСЧЕТ ДЛЯ ЦЕЛЕВОЙ ПРИБЫЛИ", {
                 "Целевая прибыль": f"{product.target_profit:.2f}₽",
-                "+ Логистика": f"+{logistics_cost:.2f}₽",
+                "+ Логистика": f"+{logistics_cost_buffered:.2f}₽",
                 "+ Закупка": f"+{product.purchase_price:.2f}₽",
-                "Сумма до комиссии": f"{(product.target_profit + logistics_cost + product.purchase_price):.2f}₽",
+                "Сумма до комиссии": f"{(product.target_profit + logistics_cost_buffered + product.purchase_price):.2f}₽",
                 "Банковская комиссия": f"{Config.BANK_COMMISSION * 100}%",
                 "Требуемый forPay": f"{target_forpay:.2f}₽",
                 "Ожидаемая прибыль": f"{expected_profit:.2f}₽"
@@ -974,7 +1123,7 @@ class PriceUpdater:
 
             price_change_absolute = new_total_price_rounded - product.current_price_wb
             price_change_percent = (
-                        price_change_absolute / product.current_price_wb * 100) if product.current_price_wb > 0 else 0
+                    price_change_absolute / product.current_price_wb * 100) if product.current_price_wb > 0 else 0
 
             self._log_table("РАСЧЕТ ЦЕНЫ НА WB", {
                 "Новый priceWithDisc": f"{new_price_wd:.2f}₽",
@@ -994,7 +1143,7 @@ class PriceUpdater:
 
             if validation:
                 validation.discount = api_discount
-                validation.logistics_cost = logistics_cost
+                validation.logistics_cost = logistics_cost_buffered
 
                 self._log_separator("РЕШЕНИЕ: НЕ ИЗМЕНЯТЬ ЦЕНУ", "!")
                 self.logger.warning(f"❌ {validation.reason}")
@@ -1019,7 +1168,7 @@ class PriceUpdater:
                 error_msg=f"Корректировка прибыли: {product.target_profit - current_profit:+.0f} ₽",
                 discount=api_discount,
                 sku_wb=product.sku_wb,
-                logistics_cost=logistics_cost,
+                logistics_cost=logistics_cost_buffered,
                 finished_price=finished_price,
                 current_profit=current_profit,
                 target_profit=product.target_profit,
@@ -1041,7 +1190,9 @@ class PriceUpdater:
                 "Изменение прибыли": f"{product.target_profit - current_profit:+.0f}₽",
                 "Использовано продаж": len(valid_sales),
                 "Скидка WB": f"{api_discount:.1f}%",
-                "Логистика": f"{logistics_cost:.0f}₽"
+                "Логистика (из отчета)": f"{logistics_cost:.0f}₽",
+                "Логистика (с буфером)": f"{logistics_cost_buffered:.0f}₽",
+                "Буфер": f"{buffer_reason}"
             })
 
             await self.db_logger.log(
@@ -1060,7 +1211,12 @@ class PriceUpdater:
                     "profit_diff": product.target_profit - current_profit,
                     "avg_ratio_forpay_to_price": avg_ratio,
                     "target_forpay": target_forpay,
-                    "expected_profit_with_new_price": expected_profit
+                    "expected_profit_with_new_price": expected_profit,
+                    "logistics_from_report": logistics_cost,
+                    "logistics_with_buffer": logistics_cost_buffered,
+                    "buffer_factor": final_buffer_factor,
+                    "buffer_reason": buffer_reason,
+                    "historical_logistics_data_points": len(historical_logistics) if historical_logistics else 0
                 }
             )
 
@@ -1177,6 +1333,71 @@ class PriceUpdater:
         self.logger.info("✅ ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ")
         return None
 
+    async def get_logistics_history_from_reports(self, vendor_code: str) -> List[float]:
+        """Получает историю логистики для артикула из отчетов WB за последние 7 дней"""
+        try:
+            moscow_tz = pytz.timezone('Europe/Moscow')
+            date_to = datetime.now(moscow_tz).strftime("%Y-%m-%d")
+            date_from = (datetime.now(moscow_tz) - timedelta(days=7)).strftime("%Y-%m-%d")
+
+            self.logger.debug(f"📊 Запрос истории логистики для {vendor_code} за {date_from} - {date_to}")
+
+            url = "https://statistics-api.wildberries.ru/api/v5/supplier/reportDetailByPeriod"
+            headers = {"Authorization": Config.WB_SALES_TOKEN}
+            params = {
+                "dateFrom": date_from,
+                "dateTo": date_to,
+                "limit": 10000,
+                "period": "daily"
+            }
+
+            async with self.session.get(url, headers=headers, params=params) as resp:
+                if resp.status == 204:
+                    return []
+                if resp.status != 200:
+                    return []
+
+                data = await resp.json()
+
+                logistics_history = []
+
+                for record in data:
+                    sa_name = record.get('sa_name', '')
+                    if sa_name != vendor_code:
+                        continue
+
+                    delivery_amount = record.get('delivery_amount', 0)
+                    return_amount = record.get('return_amount', 0)
+                    delivery_rub = record.get('delivery_rub', 0)
+
+                    try:
+                        delivery_amount_int = int(delivery_amount) if delivery_amount else 0
+                        delivery_rub_float = float(delivery_rub) if delivery_rub else 0
+                        return_amount_int = int(return_amount) if return_amount else 0
+                    except (ValueError, TypeError):
+                        continue
+
+                    # Берем только основные доставки (не возвраты) с положительной стоимостью
+                    if delivery_amount_int > 0 and delivery_rub_float > 0 and return_amount_int == 0:
+                        cost_per_unit = delivery_rub_float / delivery_amount_int
+                        logistics_history.append(cost_per_unit)
+
+                # Убираем дубликаты и сортируем по времени (поскольку отчеты могут идти не по порядку)
+                # Используем медиану за каждый день
+                if logistics_history:
+                    # Возвращаем медиану за весь период как единое значение
+                    median_cost = statistics.median(logistics_history)
+
+                    # Для более детального анализа можно группировать по дням
+                    # Но для простоты возвращаем список всех значений
+                    self.logger.debug(f"📊 Найдено {len(logistics_history)} записей логистики для {vendor_code}")
+
+                return logistics_history
+
+        except Exception as e:
+            self.logger.warning(f"⚠️  Не удалось получить историю логистики для {vendor_code}: {e}")
+            return []
+
     async def save_nm_id_to_db(self, vendor_code: str, nm_id: int) -> bool:
         try:
             async with self.db_pool.acquire() as conn:
@@ -1193,6 +1414,7 @@ class PriceUpdater:
         except Exception as e:
             self.logger.error(f"❌ Ошибка сохранения nmID для {vendor_code}: {e}")
             return False
+
 
     async def save_price_update(self, update: PriceUpdate):
         try:
@@ -1485,7 +1707,7 @@ class PriceUpdater:
             self.logger.info(f"📊 Найдено {len(sa_names_from_sales)} уникальных артикулов в продажах")
 
             # 3. Расчет логистики
-            logistics_by_sa_name = await self.get_logistics_by_sa_name(sa_names_from_sales)
+            logistics_by_sa_name = await self.get_logistics_by_sa_name_improved(sa_names_from_sales)
 
             # 4. Группировка продаж
             sales_by_vendor = defaultdict(list)
