@@ -182,7 +182,7 @@ def get_acceptance_tariff():
         all_tariffs = resp.json()
 
         # Логируем полный ответ от API тарифов
-        #log_json_response("Ответ от Tariffs API", all_tariffs)
+        #цУУ log_json_response("Ответ от Tariffs API", all_tariffs)
 
 
         if not all_tariffs:
