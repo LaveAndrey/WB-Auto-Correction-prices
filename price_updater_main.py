@@ -524,20 +524,42 @@ class PriceUpdater:
 
             self.logger.info(f"✅ Получено {len(all_tariffs)} записей о тарифах")
 
-            today_date = date.today().strftime('%Y-%m-%d')
-            tariffs_found = 0
-
+            # Группируем тарифы по складам
+            warehouse_tariffs = defaultdict(list)
             for tariff in all_tariffs:
                 warehouse_id = tariff.get('warehouseID')
-                box_type_id = tariff.get('boxTypeID')
+                if warehouse_id:
+                    warehouse_tariffs[warehouse_id].append(tariff)
 
-                if box_type_id != Config.WB_BOX_TYPE or warehouse_id not in warehouse_info:
+            tariffs_found = 0
+
+            # Для каждого склада выбираем самый актуальный валидный тариф
+            for warehouse_id, tariffs in warehouse_tariffs.items():
+                if warehouse_id not in warehouse_info:
                     continue
 
-                coefficient = tariff.get('coefficient')
-                allow_unload = tariff.get('allowUnload')
+                # Фильтруем только валидные тарифы (сортировка по типу коробки)
+                valid_tariffs = []
+                for tariff in tariffs:
+                    box_type_id = tariff.get('boxTypeID')
+                    coefficient = tariff.get('coefficient')
+                    allow_unload = tariff.get('allowUnload')
 
-                if coefficient in [0, 1] and allow_unload is True:
+                    if box_type_id != Config.WB_BOX_TYPE:
+                        continue
+
+                    if coefficient in [0, 1] and allow_unload is True:
+                        valid_tariffs.append(tariff)
+
+                if not valid_tariffs:
+                    self.logger.debug(f"   ⚠️  Для склада {warehouse_id} нет валидных тарифов")
+                    continue
+
+                # Выбираем самый актуальный тариф (самую позднюю дату)
+                best_tariff = None
+                best_tariff_date = None
+
+                for tariff in valid_tariffs:
                     api_date_str = tariff.get('date', '')
                     try:
                         if api_date_str.endswith('Z'):
@@ -545,28 +567,34 @@ class PriceUpdater:
                         else:
                             api_date = datetime.fromisoformat(api_date_str)
 
-                        api_date_simple = api_date.strftime('%Y-%m-%d')
-
-                        if api_date_simple <= today_date:
-                            warehouse_name = warehouse_info[warehouse_id]['name']
-                            orders_count = self.warehouse_orders_stats.get(warehouse_name, 0)
-
-                            self.warehouse_logistics[warehouse_id] = WarehouseLogistics(
-                                warehouse_id=warehouse_id,
-                                warehouse_name=warehouse_name,
-                                delivery_base=self._parse_float(tariff.get('deliveryBaseLiter')),
-                                delivery_liter=self._parse_float(tariff.get('deliveryAdditionalLiter')),
-                                storage_base=self._parse_float(tariff.get('storageBaseLiter')),
-                                storage_liter=self._parse_float(tariff.get('storageAdditionalLiter')),
-                                coefficient=coefficient,
-                                is_sorting_center=warehouse_info[warehouse_id]['is_sc'],
-                                orders_count=orders_count
-                            )
-                            tariffs_found += 1
-
+                        if best_tariff is None or api_date > best_tariff_date:
+                            best_tariff = tariff
+                            best_tariff_date = api_date
                     except Exception as e:
                         self.logger.debug(f"Ошибка парсинга даты {api_date_str}: {e}")
                         continue
+
+                if best_tariff:
+                    warehouse_name = warehouse_info[warehouse_id]['name']
+                    orders_count = self.warehouse_orders_stats.get(warehouse_name, 0)
+
+                    self.warehouse_logistics[warehouse_id] = WarehouseLogistics(
+                        warehouse_id=warehouse_id,
+                        warehouse_name=warehouse_name,
+                        delivery_base=self._parse_float(best_tariff.get('deliveryBaseLiter')),
+                        delivery_liter=self._parse_float(best_tariff.get('deliveryAdditionalLiter')),
+                        storage_base=self._parse_float(best_tariff.get('storageBaseLiter')),
+                        storage_liter=self._parse_float(best_tariff.get('storageAdditionalLiter')),
+                        coefficient=best_tariff.get('coefficient'),
+                        is_sorting_center=warehouse_info[warehouse_id]['is_sc'],
+                        orders_count=orders_count
+                    )
+                    tariffs_found += 1
+
+                    self.logger.debug(f"   ✅ Склад {warehouse_name}: "
+                                      f"тариф {best_tariff.get('deliveryBaseLiter')} + {best_tariff.get('deliveryAdditionalLiter')} ₽/л, "
+                                      f"дата: {best_tariff_date.strftime('%Y-%m-%d')}, "
+                                      f"заказов: {orders_count}")
 
             self.logger.info(f"✅ Получены тарифы для {tariffs_found} складов")
 
