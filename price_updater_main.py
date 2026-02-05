@@ -3,9 +3,8 @@ import logging
 import logging.handlers
 import sys
 import os
-import math
 from collections import defaultdict
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum
@@ -63,6 +62,8 @@ class Config:
     ANALYTICS_TABLE = os.getenv('ANALYTICS_TABLE', 'product_price_analytics')
     PRICE_HISTORY_TABLE = os.getenv('PRICE_HISTORY_TABLE', 'oc_product_price_history')
 
+    FORPAY_TO_PRICEWITHDISC_RATIO = float(os.getenv('FORPAY_RATIO', 0.675))
+
 
 class ProcessingStatus(Enum):
     SUCCESS = "success"
@@ -94,41 +95,46 @@ class WarehouseLogistics:
 
 
 @dataclass
-class SaleData:
+class OrderData:
     nm_id: int
     vendor_code: str
-    finished_price: float
-    price_with_desc: float
-    for_pay: float
-    spp_percent: float
-    discount_percent: float
     total_price: float
+    price_with_desc: float
+    discount_percent: float
+    spp_percent: float
+    finished_price: float
     date: str
     warehouse_name: str = ""
     quantity: int = 1
+    srid: str = ""
+    is_cancel: bool = False
+
+    @property
+    def for_pay(self) -> float:
+        """Расчет forPay на основе соотношения 0.675"""
+        if self.price_with_desc > 0:
+            return self.price_with_desc * Config.FORPAY_TO_PRICEWITHDISC_RATIO
+        elif self.finished_price > 0:
+            return self.finished_price * Config.FORPAY_TO_PRICEWITHDISC_RATIO
+        return self.total_price * Config.FORPAY_TO_PRICEWITHDISC_RATIO  # fallback
 
     @classmethod
-    def from_api_dict(cls, data: Dict) -> Optional['SaleData']:
+    def from_api_dict(cls, data: Dict) -> Optional['OrderData']:
         try:
-            price_with_desc = data.get('priceWithDisc') or data.get('price_with_desc') or 0
-            discount_percent = data.get('discountPercent') or data.get('discount') or 0
-            total_price = data.get('totalPrice') or 0
-            warehouse_name = data.get('warehouseName') or ""
-
             return cls(
                 nm_id=data.get('nmId', 0),
                 vendor_code=str(data.get('supplierArticle', '')).strip(),
-                finished_price=float(data.get('finishedPrice', 0)),
-                price_with_desc=float(price_with_desc),
-                for_pay=float(data.get('forPay', 0)),
+                total_price=float(data.get('totalPrice', 0)),
+                price_with_desc=float(data.get('priceWithDisc', 0)),
+                discount_percent=float(data.get('discountPercent', 0)),
                 spp_percent=float(data.get('spp', 0)),
-                discount_percent=float(discount_percent),
-                total_price=float(total_price),
-                date=data.get('lastChangeDate', ''),
-                warehouse_name=warehouse_name,
-                quantity=data.get('quantity', 1)
+                finished_price=float(data.get('finishedPrice', 0)),
+                date=data.get('date', ''),
+                warehouse_name=data.get('warehouseName', ''),
+                srid=data.get('srid', ''),
+                is_cancel=data.get('isCancel', False)
             )
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as e:
             return None
 
 
@@ -223,7 +229,7 @@ class PriceUpdate:
                 return f"Цена {direction} на {abs(self.new_price_wb - self.old_price_wb):.0f} ₽ (скидка: {self.discount:.1f}%)"
 
         status_reasons = {
-            ProcessingStatus.SKIPPED_NO_DATA: "Недостаточно данных о продажах",
+            ProcessingStatus.SKIPPED_NO_DATA: "Недостаточно данных о заказах",
             ProcessingStatus.SKIPPED_MIN_PRICE: "Цена ниже минимальной",
             ProcessingStatus.SKIPPED_MIN_CHANGE: "Изменение меньше порога",
             ProcessingStatus.SKIPPED_INVALID: "Некорректное значение",
@@ -349,6 +355,7 @@ class PriceUpdater:
             "MIN_SALES_FOR_CALC": Config.MIN_SALES_FOR_CALC,
             "MIN_MARGIN_FACTOR": f"×{Config.MIN_MARGIN_FACTOR}",
             "BANK_COMMISSION": f"{Config.BANK_COMMISSION * 100}%",
+            "FORPAY_RATIO": f"{Config.FORPAY_TO_PRICEWITHDISC_RATIO:.3f}",
             "Логистика по габаритам": "ВКЛЮЧЕНА",
             "Средневзвешенная логистика": "ВКЛЮЧЕНА",
             "Период статистики": "14 дней",
@@ -404,7 +411,7 @@ class PriceUpdater:
     async def _get_warehouse_orders_stats(self):
         """Получает статистику заказов по складам за последние 14 дней"""
         try:
-            date_from = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+            date_from = (datetime.now() - timedelta(days=60)).strftime('%Y-%m-%d')
 
             headers = {"Authorization": Config.WB_PRICES_TOKEN}
             params = {"dateFrom": date_from, "flag": 1}
@@ -724,68 +731,172 @@ class PriceUpdater:
         wait=wait_exponential(multiplier=1, min=4, max=10),
         retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError))
     )
-    async def fetch_wb_sales(self) -> List[SaleData]:
-        self._log_separator("ПОЛУЧЕНИЕ ПРОДАЖ С WB", "-")
+    async def fetch_wb_orders(self) -> List[OrderData]:
+        """Получает заказы с WB за последние N часов"""
+        self._log_separator("ПОЛУЧЕНИЕ ЗАКАЗОВ С WB", "-")
 
         moscow_tz = pytz.timezone('Europe/Moscow')
+
+        # Используем flag=0 для получения заказов за последние N часов
         period_start = datetime.now(moscow_tz) - timedelta(hours=Config.SALES_HOURS_FILTER)
         date_from = period_start.strftime("%Y-%m-%dT%H:%M:%S")
 
-        self.logger.info(f"📊 Запрашиваем продажи за последние {Config.SALES_HOURS_FILTER} часов")
+        self.logger.info(f"📊 Запрашиваем заказы за последние {Config.SALES_HOURS_FILTER} часов")
         self.logger.info(f"📅 Период: с {date_from}")
+        self.logger.info(f"🎯 Используем flag=0 (заказы с указанной даты)")
+        self.logger.info(f"📊 Соотношение forPay/priceWithDisc: {Config.FORPAY_TO_PRICEWITHDISC_RATIO:.3f}")
 
-        url = "https://statistics-api.wildberries.ru/api/v1/supplier/sales"
         headers = {
             "Authorization": Config.WB_SALES_TOKEN,
             "Accept": "application/json"
         }
         params = {
             "dateFrom": date_from,
+            "flag": 0  # Используем flag=0 для получения заказов за период
         }
 
         try:
-            async with self.session.get(url, headers=headers, params=params) as resp:
+            async with self.session.get(Config.ORDERS_API_URL, headers=headers, params=params) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    self.logger.info(f"📥 Получено {len(data)} записей от WB API")
 
-                    sales = []
-                    invalid_sales = 0
+                    # ДЕБАГ: Показываем что пришло
+                    if data:
+                        self.logger.info(f"📥 Получено {len(data)} записей от WB API (заказы)")
+
+                        # Покажем временной диапазон заказов
+                        dates = [item.get('date') for item in data if item.get('date')]
+                        if dates:
+                            min_date = min(dates)
+                            max_date = max(dates)
+                            self.logger.info(f"📅 Диапазон дат заказов: {min_date} - {max_date}")
+
+                        # Покажем первые 3 записи для отладки
+                        for i, item in enumerate(data[:3], 1):
+                            order_date = item.get('date', '')
+                            self.logger.info(f"   {i}. Артикул: {item.get('supplierArticle')}, "
+                                             f"date: {order_date}, "
+                                             f"priceWithDisc: {item.get('priceWithDisc', 0):.0f}₽, "
+                                             f"discount: {item.get('discountPercent', 0):.1f}%, "
+                                             f"forPay(расч.): {item.get('priceWithDisc', 0) * Config.FORPAY_TO_PRICEWITHDISC_RATIO:.0f}₽")
+                    else:
+                        self.logger.warning("⚠️  API вернуло пустой массив []")
+
+                    orders = []
+                    invalid_orders = 0
+                    canceled_orders = 0
+                    total_entries = 0
 
                     for item in data:
-                        if item.get("isRealization"):
-                            sale = SaleData.from_api_dict(item)
-                            if sale and sale.finished_price > 0:
-                                sales.append(sale)
+                        total_entries += 1
+
+                        # Проверяем условия
+                        is_cancel = item.get("isCancel", False)
+                        price_with_disc = item.get("priceWithDisc", 0)
+                        vendor_code = str(item.get("supplierArticle", "")).strip()
+
+                        if is_cancel:
+                            canceled_orders += 1
+                            continue
+
+                        if all([price_with_disc, vendor_code]) and price_with_disc > 0:
+                            order = OrderData.from_api_dict(item)
+                            if order:
+                                orders.append(order)
                             else:
-                                invalid_sales += 1
+                                invalid_orders += 1
+                                self.logger.debug(f"   ❌ Невалидный заказ: {vendor_code}, "
+                                                  f"priceWithDisc={price_with_disc}")
                         else:
-                            invalid_sales += 1
+                            invalid_orders += 1
+                            self.logger.debug(f"   ⚠️  Пропущено (пустые поля): {vendor_code}")
 
-                    self.logger.info(f"📈 Актуальных продаж: {len(sales)}")
-                    if invalid_sales > 0:
-                        self.logger.warning(f"⚠️  Отфильтровано невалидных записей: {invalid_sales}")
+                    # Фильтруем заказы по времени (дополнительная проверка)
+                    filtered_orders = []
+                    for order in orders:
+                        try:
+                            order_date_str = order.date
+                            if order_date_str:
+                                # Парсим дату заказа
+                                if 'T' in order_date_str:
+                                    order_date = datetime.fromisoformat(order_date_str.replace('Z', '+00:00'))
+                                else:
+                                    order_date = datetime.fromisoformat(order_date_str)
 
-                    sales_by_vendor = defaultdict(int)
-                    for sale in sales:
-                        sales_by_vendor[sale.vendor_code] += 1
+                                # Конвертируем в московское время для сравнения
+                                order_date_moscow = order_date.astimezone(moscow_tz)
+                                period_start_moscow = period_start
 
-                    if sales_by_vendor:
-                        self.logger.info("📋 Распределение продаж по артикулам:")
-                        for vendor, count in sorted(sales_by_vendor.items(), key=lambda x: x[1], reverse=True):
-                            self.logger.info(f"   • {vendor}: {count} продаж")
+                                # Проверяем, что заказ в нужном периоде
+                                if order_date_moscow >= period_start_moscow:
+                                    filtered_orders.append(order)
+                                else:
+                                    self.logger.debug(f"   ⏰ Заказ вне периода: {order.vendor_code}, "
+                                                      f"дата: {order_date_moscow}, "
+                                                      f"период с: {period_start_moscow}")
+                        except Exception as e:
+                            self.logger.debug(f"   ⚠️  Ошибка парсинга даты: {order.date}, ошибка: {e}")
+                            filtered_orders.append(order)  # Добавляем на всякий случай
+
+                    self.logger.info(f"📈 Статистика обработки:")
+                    self.logger.info(f"   Всего записей из API: {total_entries}")
+                    self.logger.info(f"   Актуальных заказов (не отмененных): {len(orders)}")
+                    self.logger.info(f"   После фильтрации по времени: {len(filtered_orders)}")
+                    self.logger.info(f"   Отмененных заказов: {canceled_orders}")
+                    self.logger.info(f"   Пропущено записей: {invalid_orders}")
+
+                    if total_entries > 0:
+                        success_rate = (len(filtered_orders) / total_entries) * 100
+                        self.logger.info(f"   Процент успешных: {success_rate:.1f}%")
+
+                    orders_by_vendor = defaultdict(int)
+                    for order in filtered_orders:
+                        orders_by_vendor[order.vendor_code] += 1
+
+                    if orders_by_vendor:
+                        self.logger.info("📋 Распределение заказов по артикулам:")
+                        for vendor, count in sorted(orders_by_vendor.items(), key=lambda x: x[1], reverse=True)[
+                                             :10]:  # Топ-10
+                            self.logger.info(f"   • {vendor}: {count} заказов")
+
+                        self.logger.info(f"   Всего уникальных артикулов: {len(orders_by_vendor)}")
+
+                        # Покажем расчет forPay для первых артикулов
+                        sample_count = min(3, len(filtered_orders))
+                        if sample_count > 0:
+                            self.logger.info("📊 Примеры расчета forPay для первых заказов:")
+                            for i in range(sample_count):
+                                order = filtered_orders[i]
+                                calculated_forpay = order.for_pay
+                                self.logger.info(f"   {i + 1}. {order.vendor_code}: "
+                                                 f"priceWithDisc={order.price_with_desc:.0f}₽ × "
+                                                 f"{Config.FORPAY_TO_PRICEWITHDISC_RATIO:.3f} = "
+                                                 f"forPay={calculated_forpay:.0f}₽")
                     else:
-                        self.logger.warning("⚠️  Нет продаж для обработки")
+                        self.logger.warning("⚠️  Нет заказов для обработки после фильтрации")
 
-                    return sales
+                        # Покажем какие артикулы вообще были в сырых данных
+                        all_vendor_codes = set()
+                        for item in data:
+                            vc = str(item.get("supplierArticle", "")).strip()
+                            if vc:
+                                all_vendor_codes.add(vc)
+
+                        if all_vendor_codes:
+                            self.logger.info(f"📋 Артикулы в сырых данных ({len(all_vendor_codes)}):")
+                            for vc in list(all_vendor_codes)[:10]:
+                                self.logger.info(f"   • {vc}")
+
+                    return filtered_orders
                 else:
                     text = await resp.text()
                     self.logger.error(f"❌ Ошибка API WB: {resp.status}")
-                    self.logger.error(f"   Ответ сервера: {text[:200]}")
+                    self.logger.error(f"   Ответ сервера: {text[:500]}")
                     return []
 
         except Exception as e:
             self.logger.error(f"❌ Ошибка при запросе к WB API: {e}")
+            self.logger.error(traceback.format_exc())
             raise
 
     async def fetch_products_batch(self, vendor_codes: List[str]) -> Dict[str, ProductData]:
@@ -1034,7 +1145,7 @@ class PriceUpdater:
         return results
 
     async def process_product_new_logic(self, vendor_code: str,
-                                        sales: List[SaleData],
+                                        orders: List[OrderData],
                                         product: ProductData) -> PriceUpdate:
         try:
             self._log_separator(f"АНАЛИЗ ТОВАРА: {vendor_code}", "=")
@@ -1054,53 +1165,53 @@ class PriceUpdater:
                 "Складов в расчете": f"{logistics_details['warehouses_count']}",
                 "Заказов в расчете": f"{logistics_details['total_orders']}",
                 "Формула расчета": logistics_details['calculation_formula'],
-                "nmID": product.sku_wb if product.sku_wb else "не установлен"
+                "nmID": product.sku_wb if product.sku_wb else "не установлен",
+                "Соотношение forPay/priceWithDisc": f"{Config.FORPAY_TO_PRICEWITHDISC_RATIO:.3f}"
             }
 
             self._log_table("ПАРАМЕТРЫ ТОВАРА", logistics_info)
 
-            self.logger.info(f"📈 ДАННЫЕ О ПРОДАЖАХ:")
-            self.logger.info(f"   Всего продаж: {len(sales)}")
+            self.logger.info(f"📈 ДАННЫЕ О ЗАКАЗАХ:")
+            self.logger.info(f"   Всего заказов: {len(orders)}")
             self.logger.info(f"   Требуется для расчета: {Config.MIN_SALES_FOR_CALC}")
 
-            if len(sales) <= 10:
-                self.logger.info("   Детали продаж:")
-                for i, sale in enumerate(sales, 1):
-                    self.logger.info(f"   {i:2d}. totalPrice: {sale.total_price:7.0f}₽ | "
-                                     f"discount: {sale.discount_percent:5.1f}% | "
-                                     f"priceWithDisc: {sale.price_with_desc:7.0f}₽ | "
-                                     f"forPay: {sale.for_pay:7.0f}₽")
+            if len(orders) <= 10:
+                self.logger.info("   Детали заказов:")
+                for i, order in enumerate(orders, 1):
+                    self.logger.info(f"   {i:2d}. priceWithDisc: {order.price_with_desc:7.0f}₽ | "
+                                     f"discount: {order.discount_percent:5.1f}% | "
+                                     f"calculated forPay: {order.for_pay:7.0f}₽")
             else:
                 price_stats = {
-                    "min": min(s.price_with_desc for s in sales),
-                    "max": max(s.price_with_desc for s in sales),
-                    "avg": statistics.mean(s.price_with_desc for s in sales)
+                    "min": min(o.price_with_desc for o in orders),
+                    "max": max(o.price_with_desc for o in orders),
+                    "avg": statistics.mean(o.price_with_desc for o in orders)
                 }
                 self.logger.info(f"   Статистика priceWithDisc: "
                                  f"мин={price_stats['min']:.0f}₽, "
                                  f"макс={price_stats['max']:.0f}₽, "
                                  f"сред={price_stats['avg']:.0f}₽")
 
-            valid_sales = []
-            for sale in sales:
-                if (sale.price_with_desc > 0 and
-                        sale.discount_percent > 0 and
-                        sale.for_pay > 0):
-                    valid_sales.append(sale)
+            valid_orders = []
+            for order in orders:
+                if (order.price_with_desc > 0 and
+                        order.discount_percent > 0 and
+                        not order.is_cancel):
+                    valid_orders.append(order)
 
-            self.logger.info(f"✅ Валидных продаж: {len(valid_sales)}")
+            self.logger.info(f"✅ Валидных заказов: {len(valid_orders)}")
 
-            if len(valid_sales) < Config.MIN_SALES_FOR_CALC:
+            if len(valid_orders) < Config.MIN_SALES_FOR_CALC:
                 self._log_separator("РЕШЕНИЕ: ПРОПУСК", "!")
                 self.logger.warning(f"⚠️  НЕДОСТАТОЧНО ДАННЫХ")
-                self.logger.warning(f"   Требуется: {Config.MIN_SALES_FOR_CALC}, имеется: {len(valid_sales)}")
+                self.logger.warning(f"   Требуется: {Config.MIN_SALES_FOR_CALC}, имеется: {len(valid_orders)}")
 
                 await self.db_logger.log(
                     level="WARNING",
                     message=f"Недостаточно данных для расчета",
                     vendor_code=vendor_code,
                     details={
-                        "valid_sales": len(valid_sales),
+                        "valid_orders": len(valid_orders),
                         "required": Config.MIN_SALES_FOR_CALC,
                         "logistics_details": logistics_details
                     }
@@ -1112,7 +1223,7 @@ class PriceUpdater:
                     old_price_wb=product.current_price_wb,
                     profit_correction=0,
                     status=ProcessingStatus.SKIPPED_NO_DATA,
-                    error_msg=f"Недостаточно данных: {len(valid_sales)}",
+                    error_msg=f"Недостаточно данных: {len(valid_orders)}",
                     sku_wb=product.sku_wb,
                     logistics_cost=logistics_cost,
                     finished_price=0
@@ -1144,9 +1255,9 @@ class PriceUpdater:
                 product.sku_wb = new_nm_id
                 self.logger.info(f"✅ nmID сохранен: {new_nm_id}")
 
-            self.logger.info("🎯 РАСЧЕТ СКИДКИ ИЗ ПРОДАЖ:")
+            self.logger.info("🎯 РАСЧЕТ СКИДКИ ИЗ ЗАКАЗОВ:")
 
-            discount_list = [sale.discount_percent for sale in valid_sales if sale.discount_percent > 0]
+            discount_list = [order.discount_percent for order in valid_orders if order.discount_percent > 0]
 
             if discount_list:
                 median_discount = statistics.median(discount_list)
@@ -1154,7 +1265,7 @@ class PriceUpdater:
                 max_discount = max(discount_list)
                 mean_discount = statistics.mean(discount_list)
 
-                self._log_table("СТАТИСТИКА СКИДОК ИЗ ПРОДАЖ", {
+                self._log_table("СТАТИСТИКА СКИДОК ИЗ ЗАКАЗОВ", {
                     "Всего значений": len(discount_list),
                     "Мин. скидка": f"{min_discount:.1f}%",
                     "Макс. скидка": f"{max_discount:.1f}%",
@@ -1162,11 +1273,11 @@ class PriceUpdater:
                     "Медианная скидка": f"{median_discount:.1f}%"
                 })
 
-                discount_from_sales = median_discount
-                self.logger.info(f"📊 Скидка из продаж: {discount_from_sales:.1f}%")
+                discount_from_orders = median_discount
+                self.logger.info(f"📊 Скидка из заказов: {discount_from_orders:.1f}%")
             else:
-                self.logger.warning("⚠️  В продажах нет данных о скидках")
-                discount_from_sales = 0.1
+                self.logger.warning("⚠️  В заказах нет данных о скидках")
+                discount_from_orders = 0.1
 
             self.logger.info("🔄 ПОЛУЧЕНИЕ ТЕКУЩЕЙ СКИДКИ С WB API:")
             discounts_info = await self.get_wb_discounts([product.sku_wb])
@@ -1176,35 +1287,33 @@ class PriceUpdater:
                 self.logger.info(f"✅ Текущая скидка с WB API: {current_discount_from_api:.1f}%")
                 api_discount = current_discount_from_api
             else:
-                self.logger.warning(f"⚠️  Нет данных о скидке из API, используем из продаж")
-                api_discount = discount_from_sales
+                self.logger.warning(f"⚠️  Нет данных о скидке из API, используем из заказов")
+                api_discount = discount_from_orders
 
             api_discount = max(0.1, min(99.9, api_discount))
 
-            self.logger.info("📊 АНАЛИЗ ПРОДАЖ:")
+            self.logger.info("📊 АНАЛИЗ ЗАКАЗОВ:")
 
             price_wd_list = []
             forpay_list = []
-            forpay_to_price_ratios = []
 
-            for sale in valid_sales:
-                price_wd_list.append(sale.price_with_desc)
-                forpay_list.append(sale.for_pay)
-                if sale.price_with_desc > 0 and sale.for_pay > 0:
-                    ratio = sale.for_pay / sale.price_with_desc
-                    forpay_to_price_ratios.append(ratio)
+            for order in valid_orders:
+                price_wd_list.append(order.price_with_desc)
+                forpay_list.append(order.for_pay)
 
             avg_price_wd = statistics.mean(price_wd_list)
             avg_forpay = statistics.mean(forpay_list)
-            avg_ratio = statistics.mean(forpay_to_price_ratios) if forpay_to_price_ratios else 0.674
 
-            self._log_table("СТАТИСТИКА ПРОДАЖ", {
+            # Используем константное соотношение вместо расчета из данных
+            avg_ratio = Config.FORPAY_TO_PRICEWITHDISC_RATIO
+
+            self._log_table("СТАТИСТИКА ЗАКАЗОВ", {
                 "Средний priceWithDisc": f"{avg_price_wd:.2f}₽",
-                "Средний forPay": f"{avg_forpay:.2f}₽",
-                "Соотношение forPay/priceWithDisc": f"{avg_ratio:.3f}",
-                "Продаж использовано": len(valid_sales),
+                "Средний forPay (расчетный)": f"{avg_forpay:.2f}₽",
+                "Соотношение forPay/priceWithDisc (константа)": f"{avg_ratio:.3f}",
+                "Заказов использовано": len(valid_orders),
                 "Скидка из API": f"{api_discount:.1f}%",
-                "Скидка из продаж": f"{discount_from_sales:.1f}%"
+                "Скидка из заказов": f"{discount_from_orders:.1f}%"
             })
 
             self.logger.info("🧮 РАСЧЕТ ТЕКУЩЕЙ ПРИБЫЛИ:")
@@ -1246,7 +1355,7 @@ class PriceUpdater:
 
             self._log_table("РАСЧЕТ НОВОГО PRICEWITHDISC", {
                 "Требуемый forPay": f"{target_forpay:.2f}₽",
-                "Среднее соотношение": f"{avg_ratio:.3f}",
+                "Соотношение forPay/priceWithDisc": f"{avg_ratio:.3f}",
                 "Нужный priceWithDisc": f"{required_price_wd:.2f}₽",
                 "Текущий priceWithDisc": f"{avg_price_wd:.2f}₽",
                 "Изменение": f"{price_wd_diff:+.2f}₽"
@@ -1275,7 +1384,7 @@ class PriceUpdater:
                 new_price_wd = min_price
                 price_wd_diff = new_price_wd - avg_price_wd
 
-            spp = self._get_last_non_zero_spp(sales)
+            spp = self._get_last_non_zero_spp(valid_orders)
             finished_price = new_price_wd * (1 - spp / 100)
             self.logger.info(f"📉 СПП (не учитывается): {spp:.1f}%")
             self.logger.info(f"   Цена со скидкой СПП: {finished_price:.2f}₽")
@@ -1381,7 +1490,7 @@ class PriceUpdater:
                 finished_price=finished_price,
                 current_profit=current_profit,
                 target_profit=product.target_profit,
-                sales_count=len(valid_sales),
+                sales_count=len(valid_orders),
                 spp_used=spp,
                 purchase_price=product.purchase_price,
                 target_forpay=target_forpay,
@@ -1400,12 +1509,13 @@ class PriceUpdater:
                 "Старая прибыль": f"{current_profit:.0f}₽",
                 "Целевая прибыль": f"{product.target_profit:.0f}₽",
                 "Изменение прибыли": f"{product.target_profit - current_profit:+.0f}₽",
-                "Использовано продаж": len(valid_sales),
+                "Использовано заказов": len(valid_orders),
                 "Тип действия": action_type,
                 "Логистика (средневзвешенная)": f"{logistics_cost:.0f}₽",
                 "Тариф логистики": f"{self.weighted_delivery_base:.2f} + {self.weighted_delivery_liter:.2f} ₽/л",
                 "Габариты": logistics_details['dimensions'],
                 "Объем": f"{logistics_details['volume_liters']:.2f} л",
+                "Соотношение forPay/priceWithDisc": f"{Config.FORPAY_TO_PRICEWITHDISC_RATIO:.3f}",
                 "Складов в расчете": logistics_details['warehouses_count'],
                 "Заказов в расчете": logistics_details['total_orders']
             })
@@ -1428,7 +1538,7 @@ class PriceUpdater:
                     "target_profit": product.target_profit,
                     "profit_diff": product.target_profit - current_profit,
                     "action_type": action_type,
-                    "avg_ratio_forpay_to_price": avg_ratio,
+                    "forpay_ratio": Config.FORPAY_TO_PRICEWITHDISC_RATIO,
                     "target_forpay": target_forpay,
                     "expected_profit_with_new_price": expected_profit,
                     "logistics_calculated": logistics_cost,
@@ -1467,16 +1577,16 @@ class PriceUpdater:
                 finished_price=0
             )
 
-    def _get_last_non_zero_spp(self, sales: List[SaleData]) -> float:
+    def _get_last_non_zero_spp(self, orders: List[OrderData]) -> float:
         try:
-            spp_sales = [sale for sale in sales if sale.spp_percent > 0]
+            spp_orders = [order for order in orders if order.spp_percent > 0]
 
-            if not spp_sales:
-                self.logger.debug(f"📉 Нет продаж с положительным СПП, используем 0%")
+            if not spp_orders:
+                self.logger.debug(f"📉 Нет заказов с положительным СПП, используем 0%")
                 return 0.0
 
-            avg_spp = sum(sale.spp_percent for sale in spp_sales) / len(spp_sales)
-            self.logger.info(f"📊 Средний СПП: {avg_spp:.2f}% (на основе {len(spp_sales)} продаж)")
+            avg_spp = sum(order.spp_percent for order in spp_orders) / len(spp_orders)
+            self.logger.info(f"📊 Средний СПП: {avg_spp:.2f}% (на основе {len(spp_orders)} заказов)")
             return avg_spp
 
         except Exception as e:
@@ -1676,7 +1786,7 @@ class PriceUpdater:
                         "Прибыль до": f"{profit_before:.0f}₽",
                         "Ожидаемая прибыль после": f"{profit_after:.0f}₽",
                         "Изменение прибыли": f"{profit_diff:+.0f}₽",
-                        "Продаж использовано": update.sales_count,
+                        "Заказов использовано": update.sales_count,
                         "Логистика (средневзвешенная)": f"{update.logistics_cost:.0f}₽"
                     })
 
@@ -1813,14 +1923,14 @@ class PriceUpdater:
 
             while self.is_running:
                 try:
-                    vendor_code, sales, product = await asyncio.wait_for(
+                    vendor_code, orders, product = await asyncio.wait_for(
                         self.queue.get(),
                         timeout=1.0
                     )
 
                     self.logger.info(f"👷 Воркер #{worker_id} обрабатывает: {vendor_code}")
 
-                    update = await self.process_product_new_logic(vendor_code, sales, product)
+                    update = await self.process_product_new_logic(vendor_code, orders, product)
 
                     if update.status == ProcessingStatus.SUCCESS:
                         await self.save_price_update(update)
@@ -1866,36 +1976,38 @@ class PriceUpdater:
         self.successful_updates = []
 
         try:
-            sales_data = await self.fetch_wb_sales()
+            # Используем заказы вместо продаж
+            orders_data = await self.fetch_wb_orders()
 
-            if not sales_data:
+            if not orders_data:
                 self._log_separator("ЦИКЛ ПРЕРВАН", "⚠️")
-                self.logger.warning("⚠️  Нет данных о продажах")
+                self.logger.warning("⚠️  Нет данных о заказах")
                 await self.db_logger.log(
                     level="WARNING",
-                    message="Нет данных о продажах",
+                    message="Нет данных о заказах",
                     details={"cycle_id": self.current_cycle}
                 )
                 return
 
-            sa_names_from_sales = []
-            for sale in sales_data:
-                if sale.vendor_code and sale.vendor_code not in sa_names_from_sales:
-                    sa_names_from_sales.append(sale.vendor_code)
+            sa_names_from_orders = []
+            for order in orders_data:
+                if order.vendor_code and order.vendor_code not in sa_names_from_orders:
+                    sa_names_from_orders.append(order.vendor_code)
 
-            self.logger.info(f"📊 Найдено {len(sa_names_from_sales)} уникальных артикулов в продажах")
+            self.logger.info(f"📊 Найдено {len(sa_names_from_orders)} уникальных артикулов в заказах")
 
-            sales_by_vendor = defaultdict(list)
-            for sale in sales_data:
-                if sale.vendor_code:
-                    sales_by_vendor[sale.vendor_code].append(sale)
+            orders_by_vendor = defaultdict(list)
+            for order in orders_data:
+                if order.vendor_code:
+                    orders_by_vendor[order.vendor_code].append(order)
 
-            vendor_codes = list(sales_by_vendor.keys())
+            vendor_codes = list(orders_by_vendor.keys())
 
             self._log_table("ОБНАРУЖЕННЫЕ АРТИКУЛЫ", {
-                "Всего артикулов с продажами": len(vendor_codes),
+                "Всего артикулов с заказами": len(vendor_codes),
                 "Тариф логистики (средневзвешенный)": f"{self.weighted_delivery_base:.2f} + {self.weighted_delivery_liter:.2f} ₽/л",
-                "Складов в расчете логистики": len(self.warehouse_logistics)
+                "Складов в расчете логистики": len(self.warehouse_logistics),
+                "Соотношение forPay/priceWithDisc": f"{Config.FORPAY_TO_PRICEWITHDISC_RATIO:.3f}"
             })
 
             product_map = await self.fetch_products_batch(vendor_codes)
@@ -1920,14 +2032,14 @@ class PriceUpdater:
                     product = product_map[vendor_code]
 
                     await self.queue.put((vendor_code,
-                                          sales_by_vendor[vendor_code],
+                                          orders_by_vendor[vendor_code],
                                           product))
                     queue_tasks += 1
 
                     if queue_tasks <= 5:
                         logistics_cost, _ = await self.get_logistics_by_volume(product)
                         self.logger.info(f"📥 Добавлен: {vendor_code} "
-                                         f"({len(sales_by_vendor[vendor_code])} продаж, "
+                                         f"({len(orders_by_vendor[vendor_code])} заказов, "
                                          f"логистика {logistics_cost:.0f}₽, "
                                          f"габариты {product.length}x{product.width}x{product.height}см)")
                 else:
