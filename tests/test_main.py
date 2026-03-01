@@ -3,7 +3,6 @@
 """
 
 import pytest
-import asyncio
 from unittest.mock import AsyncMock, Mock, patch
 from datetime import datetime, timedelta
 import pytz
@@ -12,9 +11,9 @@ import os
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from price_updater_main import (
+from WB_integration.price_updater_main import (
     PriceUpdater, SaleData, ProductData, PriceUpdate,
-    ProcessingStatus, Config
+    ProcessingStatus
 )
 
 

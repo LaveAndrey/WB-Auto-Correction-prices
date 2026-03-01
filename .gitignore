@@ -1,3 +1,5 @@
 .env
 price_update.log
 get_fbs.py
+testing.py
+WB_integration/price_updater_main.py

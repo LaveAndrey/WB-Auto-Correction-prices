@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-LOAD_PRICE_TO_WB = True
+LOAD_PRICE_TO_WB = False
 
 class Config:
     DB_HOST = os.getenv('DB_HOST')
@@ -568,7 +568,7 @@ class PriceUpdater:
                     if box_type_id != Config.WB_BOX_TYPE:
                         continue
 
-                    if coefficient in [0, 1] and allow_unload is True:
+                    if coefficient in [0, 1, -1] and allow_unload is True:
                         valid_tariffs.append(tariff)
 
                 if not valid_tariffs:
