@@ -275,3 +275,69 @@ class DatabaseLogger:
                 **details
             }
         )
+
+    async def log_promotion_wb(self,
+                               vendor_code: str,
+                               nm_id: int,
+                               promotion_id: int,
+                               promotion_title: str,
+                               action: str,
+                               # 'ramp_start', 'price_increased', 'locked', 'unlocked', 'restored', 'protected'
+                               old_price: float = None,
+                               new_price: float = None,
+                               daily_increase: float = None,
+                               days_until_start: int = None,
+                               details: Dict[str, Any] = None):
+        """
+        Логирование действий с акциями Wildberries
+
+        action может быть:
+        - 'ramp_start' - начало повышения цены перед акцией
+        - 'price_increased' - ежедневное повышение цены
+        - 'locked' - блокировка цены на время акции
+        - 'unlocked' - разблокировка после акции
+        - 'restored' - восстановление исходной цены
+        - 'protected' - защита товара до начала акции
+        - 'skipped_promotion' - пропуск товара из-за акции
+        """
+
+        action_messages = {
+            'ramp_start': '🚀 Начало повышения цены перед акцией (WB)',
+            'price_increased': '📈 Повышение цены перед акцией (WB)',
+            'locked': '🔒 Блокировка цены на время акции (WB)',
+            'unlocked': '🔓 Разблокировка цены после акции (WB)',
+            'restored': '🔄 Восстановление исходной цены после акции (WB)',
+            'protected': '🛡️ Защита товара до начала акции (WB)',
+            'skipped_promotion': '⏭️ Пропуск товара (участвует в акции WB)'
+        }
+
+        message = action_messages.get(action, f"Акция WB: {action}")
+
+        log_details = {
+            "event": "wb_promotion",
+            "promotion_id": promotion_id,
+            "promotion_title": promotion_title,
+            "action": action,
+            "vendor_code": vendor_code,
+            "nm_id": nm_id
+        }
+
+        if old_price is not None:
+            log_details["old_price"] = round(old_price, 2)
+        if new_price is not None:
+            log_details["new_price"] = round(new_price, 2)
+        if daily_increase is not None:
+            log_details["daily_increase"] = round(daily_increase, 2)
+        if days_until_start is not None:
+            log_details["days_until_start"] = days_until_start
+        if details:
+            log_details.update(details)
+
+        await self.log(
+            level="INFO",
+            message=f"{message} для {vendor_code}",
+            vendor_code=vendor_code,
+            nm_id=nm_id,
+            action_type="promotion",
+            details=log_details
+        )

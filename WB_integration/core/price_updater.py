@@ -338,7 +338,7 @@ class PriceUpdater:
 
             self.logger.info(f"📋 Запрашиваем тарифы для {len(warehouse_ids_to_fetch)} складов с заказами")
             all_tariffs = await self.wb_client.get_warehouse_tariffs(warehouse_ids_to_fetch)
-            print(json.dumps(all_tariffs, indent=2, ensure_ascii=False))
+            #print(json.dumps(all_tariffs, indent=2, ensure_ascii=False))
 
             if not all_tariffs:
                 self.logger.error("❌ API вернуло пустой ответ")
@@ -2382,38 +2382,39 @@ class PriceUpdater:
             if Config.LOAD_PRICE_TO_WB and self.successful_updates:
                 await self.upload_prices_to_wb(self.successful_updates)
 
-            if hasattr(self, 'promotion_manager') and self.promotion_manager:
+            if Config.PROMOTIONS_ENABLED:
+                if hasattr(self, 'promotion_manager') and self.promotion_manager:
 
-                # 7.1 ПОЛУЧАЕМ АКЦИИ ИЗ WB API
-                self._log_separator("ПОЛУЧЕНИЕ АКЦИЙ WB", "🎯")
-                await self.promotion_manager.sync_promotions_from_wb()
+                    # 7.1 ПОЛУЧАЕМ АКЦИИ ИЗ WB API
+                    self._log_separator("ПОЛУЧЕНИЕ АКЦИЙ WB", "🎯")
+                    await self.promotion_manager.sync_promotions_from_wb()
 
-                # 👇 ВАЖНО: берём ТОЛЬКО товары с продажами
-                products_with_sales = []
-                for product in product_map.values():
-                    if hasattr(product, 'has_sales_last_period_wb') and product.has_sales_last_period_wb:
-                        products_with_sales.append(product)
+                    # 👇 ВАЖНО: берём ТОЛЬКО товары с продажами
+                    products_with_sales = []
+                    for product in product_map.values():
+                        if hasattr(product, 'has_sales_last_period_wb') and product.has_sales_last_period_wb:
+                            products_with_sales.append(product)
 
-                self.logger.info(f"📊 Товаров с продажами для акций: {len(products_with_sales)} из {len(product_map)}")
-                await self.promotion_manager.check_and_create_ramp_plans(products_with_sales)
+                    self.logger.info(f"📊 Товаров с продажами для акций: {len(products_with_sales)} из {len(product_map)}")
+                    await self.promotion_manager.check_and_create_ramp_plans(products_with_sales)
 
-                stats = await self.promotion_manager.get_promotion_stats()
-                self.logger.info(f"📊 Статистика акций: {stats}")
-                self.stats['promotions_scheduled_wb'] = stats.get('pending_products', 0) + stats.get('ramping_products',
-                                                                                                     0)
+                    stats = await self.promotion_manager.get_promotion_stats()
+                    self.logger.info(f"📊 Статистика акций: {stats}")
+                    self.stats['promotions_scheduled_wb'] = stats.get('pending_products', 0) + stats.get('ramping_products',
+                                                                                                         0)
 
-                # 7.2 ПОВЫШАЕМ ЦЕНЫ (каждый 24-й цикл)
-                if self.current_cycle % 24 == 0:
-                    self.logger.info(f"📅 Цикл #{self.current_cycle} кратен 24 - выполняем дневное повышение")
-                    updated, locked = await self.promotion_manager.execute_daily_price_ramp()
-                    if updated > 0 or locked > 0:
-                        self.logger.info(f"📈 Акции: повышено {updated}, заблокировано {locked}")
-                else:
-                    self.logger.debug(f"⏰ Цикл #{self.current_cycle} - пропускаем повышение")
+                    # 7.2 ПОВЫШАЕМ ЦЕНЫ (каждый 24-й цикл)
+                    if self.current_cycle % 24 == 0:
+                        self.logger.info(f"📅 Цикл #{self.current_cycle} кратен 24 - выполняем дневное повышение")
+                        updated, locked = await self.promotion_manager.execute_daily_price_ramp()
+                        if updated > 0 or locked > 0:
+                            self.logger.info(f"📈 Акции: повышено {updated}, заблокировано {locked}")
+                    else:
+                        self.logger.debug(f"⏰ Цикл #{self.current_cycle} - пропускаем повышение")
 
-                # 7.3 БЛОКИРОВКИ ПРОВЕРЯЕМ КАЖДЫЙ ЦИКЛ
-                locked = await self.promotion_manager.update_promotion_locks()
-                self.stats['products_in_promotion_wb'] = locked
+                    # 7.3 БЛОКИРОВКИ ПРОВЕРЯЕМ КАЖДЫЙ ЦИКЛ
+                    locked = await self.promotion_manager.update_promotion_locks()
+                    self.stats['products_in_promotion_wb'] = locked
             # ========== 8. СБОР СТАТИСТИКИ ==========
             cycle_end = datetime.now()
             duration = (cycle_end - cycle_start).total_seconds()

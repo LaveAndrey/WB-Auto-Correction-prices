@@ -105,6 +105,69 @@ class DatabaseLogger:
             }
         )
 
+    async def log_promotion_ozon(self,
+                                 vendor_code: str,
+                                 sku_ozon: int,
+                                 promotion_id: int,
+                                 promotion_title: str,
+                                 action: str,  # 'ramp_start', 'price_increased', 'locked', 'unlocked', 'restored'
+                                 old_price: float = None,
+                                 new_price: float = None,
+                                 daily_increase: float = None,
+                                 days_until_start: int = None,
+                                 details: Dict[str, Any] = None):
+        """
+        Логирование действий с акциями Ozon
+
+        action может быть:
+        - 'ramp_start' - начало повышения цены перед акцией
+        - 'price_increased' - ежедневное повышение цены
+        - 'locked' - блокировка цены на время акции
+        - 'unlocked' - разблокировка после акции
+        - 'restored' - восстановление исходной цены
+        - 'skipped_promotion' - пропуск товара из-за акции
+        """
+
+        action_messages = {
+            'ramp_start': '🚀 Начало повышения цены перед акцией',
+            'price_increased': '📈 Повышение цены перед акцией',
+            'locked': '🔒 Блокировка цены на время акции',
+            'unlocked': '🔓 Разблокировка цены после акции',
+            'restored': '🔄 Восстановление исходной цены после акции',
+            'skipped_promotion': '⏭️ Пропуск товара (участвует в акции)'
+        }
+
+        message = action_messages.get(action, f"Акция: {action}")
+
+        log_details = {
+            "event": "ozon_promotion",
+            "promotion_id": promotion_id,
+            "promotion_title": promotion_title,
+            "action": action,
+            "vendor_code": vendor_code,
+            "sku_ozon": sku_ozon
+        }
+
+        if old_price is not None:
+            log_details["old_price"] = round(old_price, 2)
+        if new_price is not None:
+            log_details["new_price"] = round(new_price, 2)
+        if daily_increase is not None:
+            log_details["daily_increase"] = round(daily_increase, 2)
+        if days_until_start is not None:
+            log_details["days_until_start"] = days_until_start
+        if details:
+            log_details.update(details)
+
+        await self.log(
+            level="INFO",
+            message=f"{message} для {vendor_code}: {promotion_title}",
+            vendor_code=vendor_code,
+            sku_ozon=sku_ozon,
+            action_type="promotion",
+            details=log_details
+        )
+
     async def log_price_calculation(self,
                                     vendor_code: str,
                                     sku_ozon: int,

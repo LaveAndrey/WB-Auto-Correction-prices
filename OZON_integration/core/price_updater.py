@@ -1635,21 +1635,22 @@ class OzonPriceUpdater:
         error_message = None
 
         try:
-            if self.promotion_manager and self.current_cycle % Config.PROMOTION_SYNC_CYCLE == 0:
-                self._log_separator("ПОЛУЧЕНИЕ АКЦИЙ OZON", "🎯")
-                await self.promotion_manager.sync_promotions_from_ozon()
-                await self.promotion_manager.check_and_create_ramp_plans()
-                stats = await self.promotion_manager.get_promotion_stats()
-                self.stats['promotions_scheduled'] = stats.get('pending_products', 0) + stats.get('ramping_products', 0)
+            if Config.PROMOTIONS_ENABLED:
+                if self.promotion_manager and self.current_cycle % Config.PROMOTION_SYNC_CYCLE == 0:
+                    self._log_separator("ПОЛУЧЕНИЕ АКЦИЙ OZON", "🎯")
+                    await self.promotion_manager.sync_promotions_from_ozon()
+                    await self.promotion_manager.check_and_create_ramp_plans()
+                    stats = await self.promotion_manager.get_promotion_stats()
+                    self.stats['promotions_scheduled'] = stats.get('pending_products', 0) + stats.get('ramping_products', 0)
 
-            if self.promotion_manager:
-                updated, locked = await self.promotion_manager.execute_daily_price_ramp()
-                if updated > 0 or locked > 0:
-                    self.logger.info(f"📈 Акции: повышено {updated}, заблокировано {locked}")
+                if self.promotion_manager:
+                    updated, locked = await self.promotion_manager.execute_daily_price_ramp()
+                    if updated > 0 or locked > 0:
+                        self.logger.info(f"📈 Акции: повышено {updated}, заблокировано {locked}")
 
-            if self.promotion_manager:
-                locked = await self.promotion_manager.update_promotion_locks()
-                self.stats['products_in_promotion'] = locked
+                if self.promotion_manager:
+                    locked = await self.promotion_manager.update_promotion_locks()
+                    self.stats['products_in_promotion'] = locked
 
             # Получаем заказы с Ozon
             self.logger.info(f"📥 Получение заказов за последние {Config.SALES_HOURS_FILTER} часов...")
