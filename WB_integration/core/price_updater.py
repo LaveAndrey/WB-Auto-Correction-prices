@@ -572,6 +572,7 @@ class PriceUpdater:
             self.logger.debug(f"   Базовая логистика: {base_logistics:.2f} ₽")
             self.logger.debug(f"   Итоговая логистика: {total_logistics:.2f} ₽")
             return total_logistics, calculation_details
+
         primary_warehouse = None
         if vendor_code:
             primary_warehouse = await self.get_primary_warehouse_for_product(vendor_code)
@@ -838,61 +839,67 @@ class PriceUpdater:
 
             # ===== НОВЫЙ БЛОК: ПОЛУЧЕНИЕ СТОИМОСТИ ЛОГИСТИКИ С УЧЁТОМ ВОЗВРАТОВ =====
             # Сначала пробуем получить средневзвешенную из статистики
-            avg_logistics = await self.get_weighted_wb_logistics(vendor_code)
 
-            if avg_logistics is not None and avg_logistics > 0:
-                logistics_cost = avg_logistics
-                logistics_details = {
-                    'source': 'weighted_stats',
-                    'avg_logistics': avg_logistics,
-                    'stats_days': 30  # можно вынести в конфиг
-                }
-                self.logger.info(f"📊 Используем средневзвешенную логистику: {logistics_cost:.2f}₽")
+            if Config.USE_FIXED_TARIFF:
+                logistics_cost, logistics_details = await self.get_logistics_by_volume(product, vendor_code)
+                self.logger.info(f"🔧 Фиксированные тарифы (заглушка): {logistics_cost:.2f}₽")
             else:
-                # Если статистики нет, собираем данные по текущим заказам
-                # Для каждого заказа определяем склад и рассчитываем логистику по его тарифам
-                order_costs = []
-                for order in orders:
-                    # Определяем склад по warehouse_name
-                    warehouse = None
-                    for wh in self.warehouse_logistics.values():
-                        if wh.warehouse_name == order.warehouse_name:
-                            warehouse = wh
-                            break
+                # Сначала пробуем получить средневзвешенную из статистики
+                avg_logistics = await self.get_weighted_wb_logistics(vendor_code)
 
-                    if warehouse:
-                        # Рассчитываем логистику для данного склада с учётом габаритов товара
-                        volume = calculate_volume(product.length, product.width, product.height)
-                        base_logistics = warehouse.delivery_base + max(volume - 1.0, 0.0) * warehouse.delivery_liter
-                        cost = base_logistics * Config.LOCALIZATION_INDEX
-                    else:
-                        # Если склад не найден, используем средневзвешенную (как раньше)
-                        cost, _ = await self.get_logistics_by_volume(product)
-
-                    order_costs.append(cost)
-
-                    # Обновляем статистику (is_returned = order.is_cancel)
-                    await self.update_wb_logistics_stats(
-                        vendor_code=vendor_code,
-                        warehouse_id=warehouse.warehouse_id if warehouse else 0,
-                        delivery_cost=cost,
-                        is_returned=order.is_cancel
-                    )
-
-                if order_costs:
-                    logistics_cost = sum(order_costs) / len(order_costs)
+                if avg_logistics is not None and avg_logistics > 0:
+                    logistics_cost = avg_logistics
                     logistics_details = {
-                        'source': 'current_orders_avg',
-                        'avg_logistics': logistics_cost,
-                        'orders_processed': len(order_costs)
+                        'source': 'weighted_stats',
+                        'avg_logistics': avg_logistics,
+                        'stats_days': 30  # можно вынести в конфиг
                     }
+                    self.logger.info(f"📊 Используем средневзвешенную логистику: {logistics_cost:.2f}₽")
                 else:
-                    # Аварийный вариант – fallback
-                    logistics_cost, logistics_details = await self.get_logistics_by_volume(product, vendor_code)
-                    logistics_details['source'] = 'fallback_volume'
+                    # Если статистики нет, собираем данные по текущим заказам
+                    # Для каждого заказа определяем склад и рассчитываем логистику по его тарифам
+                    order_costs = []
+                    for order in orders:
+                        # Определяем склад по warehouse_name
+                        warehouse = None
+                        for wh in self.warehouse_logistics.values():
+                            if wh.warehouse_name == order.warehouse_name:
+                                warehouse = wh
+                                break
 
-            self.logger.debug(
-                f"📦 Логистика для {vendor_code}: {logistics_cost:.2f}₽ (источник: {logistics_details['source']})")
+                        if warehouse:
+                            # Рассчитываем логистику для данного склада с учётом габаритов товара
+                            volume = calculate_volume(product.length, product.width, product.height)
+                            base_logistics = warehouse.delivery_base + max(volume - 1.0, 0.0) * warehouse.delivery_liter
+                            cost = base_logistics * Config.LOCALIZATION_INDEX
+                        else:
+                            # Если склад не найден, используем средневзвешенную (как раньше)
+                            cost, _ = await self.get_logistics_by_volume(product)
+
+                        order_costs.append(cost)
+
+                        # Обновляем статистику (is_returned = order.is_cancel)
+                        await self.update_wb_logistics_stats(
+                            vendor_code=vendor_code,
+                            warehouse_id=warehouse.warehouse_id if warehouse else 0,
+                            delivery_cost=cost,
+                            is_returned=order.is_cancel
+                        )
+
+                    if order_costs:
+                        logistics_cost = sum(order_costs) / len(order_costs)
+                        logistics_details = {
+                            'source': 'current_orders_avg',
+                            'avg_logistics': logistics_cost,
+                            'orders_processed': len(order_costs)
+                        }
+                    else:
+                        # Аварийный вариант – fallback
+                        logistics_cost, logistics_details = await self.get_logistics_by_volume(product, vendor_code)
+                        logistics_details['source'] = 'fallback_volume'
+
+                self.logger.debug(
+                    f"📦 Логистика для {vendor_code}: {logistics_cost:.2f}₽ (источник: {logistics_details['source']})")
             # ===== КОНЕЦ НОВОГО БЛОКА =====
 
             # Получаем текущую скидку с WB API
