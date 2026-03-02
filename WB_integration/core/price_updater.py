@@ -542,7 +542,39 @@ class PriceUpdater:
         Если передан vendor_code, пытается найти основной склад для этого товара.
         Если основного склада нет, использует глобальный топ-склад (по всем товарам).
         """
-        # Пытаемся найти основной склад для данного товара
+
+        async def get_logistics_by_volume(self, product: ProductData, vendor_code: str = None) -> Tuple[float, Dict]:
+            # ===== ВРЕМЕННАЯ ЗАГЛУШКА =====
+            if Config.USE_FIXED_TARIFF:
+                self.logger.info("🔧 Используем временные фиксированные тарифы (заглушка 34.5 + 10.5)")
+                delivery_base = Config.FIXED_DELIVERY_BASE
+                delivery_liter = Config.FIXED_DELIVERY_LITER
+                warehouse_name = "Фиксированный тариф (временный)"
+
+                volume = calculate_volume(product.length, product.width, product.height)
+                base_logistics = delivery_base + max(volume - 1.0, 0.0) * delivery_liter
+                total_logistics = base_logistics * Config.LOCALIZATION_INDEX
+
+                calculation_details = {
+                    'dimensions': f"{product.length}x{product.width}x{product.height} см",
+                    'volume_liters': volume,
+                    'delivery_base': delivery_base,
+                    'delivery_liter': delivery_liter,
+                    'warehouse_name': warehouse_name,
+                    'localization_index': Config.LOCALIZATION_INDEX,
+                    'base_logistics': base_logistics,
+                    'total_logistics': total_logistics,
+                    'calculation_formula': (
+                        f"({delivery_base:.2f} + max({volume:.2f} - 1, 0) × {delivery_liter:.2f}) "
+                        f"× {Config.LOCALIZATION_INDEX:.2f} = {total_logistics:.2f} ₽"
+                    ),
+                    'source': 'fixed_tariff_fallback'
+                }
+
+                self.logger.debug(f"   Объем: {volume:.2f} л")
+                self.logger.debug(f"   Базовая логистика: {base_logistics:.2f} ₽")
+                self.logger.debug(f"   Итоговая логистика: {total_logistics:.2f} ₽")
+                return total_logistics, calculation_details
         primary_warehouse = None
         if vendor_code:
             primary_warehouse = await self.get_primary_warehouse_for_product(vendor_code)

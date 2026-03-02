@@ -253,6 +253,10 @@ class Config:
     OZON_PROMOTION_TABLE = str(os.getenv('oc_ozon_promotions')) # Таблица для хранения акций
     PROMOTIONS_ENABLED = False
 
+    USE_FIXED_TARIFF = DB_SETTINGS.get('USE_FIXED_TARIFF', False)  # по умолчанию выключено
+    FIXED_DELIVERY_BASE = 34.5
+    FIXED_DELIVERY_LITER = 10.5
+
     PROMOTION_PRICE_RESTORE = True  # Возвращать цену после акции
 
     DAILY_STATS_ENABLED = True
