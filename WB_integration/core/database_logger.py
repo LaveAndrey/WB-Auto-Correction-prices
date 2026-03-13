@@ -16,6 +16,176 @@ class DatabaseLogger:
         """Устанавливает ID текущего цикла"""
         self.cycle_id = cycle_id
 
+    def _format_details_for_display(self, details: dict) -> dict:
+        """
+        Преобразует детали события в читаемый вид для сохранения в JSON:
+        - переводит ключи на русский
+        - форматирует числа (добавляет ₽, %, л, кг)
+        - рекурсивно обрабатывает вложенные словари
+        """
+        if not isinstance(details, dict):
+            return details
+
+        # Словарь соответствия английских ключей русским
+        mapping = {
+            # Основные события
+            'event': 'Событие',
+            'timestamp': 'Время',
+            'cycle_id': 'Цикл ID',
+            'mp': 'МП',
+
+            # Цены и скидки
+            'old_price': 'Старая цена',
+            'new_price': 'Новая цена',
+            'price_change': 'Изменение цены',
+            'price_change_percent': 'Изменение, %',
+            'old_discount': 'Старая скидка',
+            'new_discount': 'Новая скидка',
+            'discount_change': 'Изменение скидки',
+            'seller_discount': 'Скидка продавца',
+            'target_discount_from_db': 'Целевая скидка из БД',
+
+            # Цены со скидкой (для WB)
+            'old_price_wd': 'Старая цена со скидкой',
+            'new_price_wd': 'Новая цена со скидкой',
+            'price_wd_diff': 'Изменение цены со скидкой',
+            'old_discounted_price': 'Старая цена со скидкой',
+            'new_discounted_price': 'Новая цена со скидкой',
+            'discounted_price_change': 'Изменение цены со скидкой',
+
+            # Прибыль
+            'current_profit': 'Текущая прибыль',
+            'target_profit': 'Целевая прибыль',
+            'profit_diff': 'Разница прибыли',
+            'expected_profit': 'Ожидаемая прибыль',
+            'profit_before': 'Прибыль до',
+            'profit_after': 'Прибыль после',
+
+            # Логистика (общая)
+            'logistics_cost': 'Логистика',
+            'logistics_details': 'Детали логистики',
+            'weight_kg': 'Вес',
+            'weight_source': 'Источник веса',
+            'volume_liters': 'Объём',
+            'dimensions': 'Габариты',
+            'region': 'Регион',
+            'city': 'Город',
+            'delivery_days': 'Срок доставки',
+            'delivery_cost': 'Стоимость доставки',
+            'tariff_name': 'Тариф',
+            'warehouse_city_code': 'Код города склада',
+
+            # Логистика WB (специфичная)
+            'weighted_base': 'Ср. баз. ставка',
+            'weighted_liter': 'Ср. за литр',
+            'warehouses_count': 'Кол-во складов',
+            'warehouses_used': 'Складов учтено',
+            'orders_used': 'Заказов учтено',
+            'localization_index': 'Индекс локализации',
+            'calculation_formula': 'Формула расчёта',
+            'delivery_base': 'Базовая ставка',
+            'delivery_liter': 'Ставка за литр',
+            'warehouse_name': 'Склад',
+            'base_logistics': 'Базовая логистика',
+            'total_logistics': 'Итого логистика',
+
+            # Данные товара
+            'vendor_code': 'Артикул',
+            'sku_ozon': 'SKU Ozon',
+            'nm_id': 'NM ID',
+            'purchase_price': 'Себестоимость',
+            'sales_used': 'Продаж учтено',
+            'total_orders': 'Всего заказов',
+            'region_stats': 'Статистика по регионам',
+            'valid_orders': 'Валидных заказов',
+            'required': 'Требуется заказов',
+            'spp_used': 'СПП, %',
+            'finished_price': 'Цена со скидкой СПП',
+
+            # НДС
+            'vat_percent': 'НДС',
+            'vat_amount': 'Сумма НДС',
+            'price_without_vat': 'Цена без НДС',
+            'vat_to_pay': 'НДС к уплате',
+            'vat_in_price': 'НДС в цене',
+            'is_own_production': 'Собственное производство',
+
+            # Комиссии и коэффициенты
+            'forpay_ratio': 'Коэф. forPay',
+            'target_forpay': 'Целевой forPay',
+            'avg_payout_ratio': 'Ср. коэф. выплаты',
+            'payout_ratio': 'Коэф. выплаты',
+
+            # Акции
+            'promotion_id': 'ID акции',
+            'promotion_title': 'Название акции',
+            'action': 'Действие',
+            'daily_increase': 'Ежедневное повышение',
+            'days_until_start': 'Дней до старта',
+            'ramp_day': 'День повышения',
+            'lock_until': 'Заблокировано до',
+            'skip_reason': 'Причина пропуска',
+            'promotion_active': 'Участвует в акции',
+            'promotion_lock_until': 'Заблокировано до',
+            'promotion_active_wb': 'Участвует в акции WB',
+            'promotion_lock_until_wb': 'Заблокировано до WB',
+
+            # Ошибки
+            'error': 'Ошибка',
+            'traceback': 'Стек вызовов',
+
+            # Прочее
+            'action_type': 'Тип действия',
+            'source': 'Источник',
+            'old_value': 'Старое значение',
+            'new_value': 'Новое значение',
+            'discount_amount': 'Сумма скидки',
+            'base_price': 'Базовая цена',
+            'discounted_price': 'Цена со скидкой',
+            'volume': 'Объём',
+
+            # API-логи
+            'method': 'Метод',
+            'url': 'URL',
+            'status_code': 'Код ответа',
+            'response_time': 'Время ответа, с',
+            'request': 'Запрос',
+            'response': 'Ответ',
+        }
+
+        result = {}
+        for eng_key, value in details.items():
+            rus_key = mapping.get(eng_key, eng_key)  # если нет в словаре, оставляем как есть
+
+            # Рекурсивная обработка вложенных словарей
+            if isinstance(value, dict):
+                result[rus_key] = self._format_details_for_display(value)
+            # Форматирование чисел
+            elif isinstance(value, (int, float)):
+                key_lower = rus_key.lower()
+                if any(word in key_lower for word in
+                       ['цена', 'прибыль', 'логистика', 'forpay', 'стоимость', 'комиссия', 'выплата', 'себестоимость',
+                        'повышение', 'сумма', 'ставка']):
+                    result[rus_key] = f"{value:.2f} ₽"
+                elif any(word in key_lower for word in ['скидка', 'ндс', 'коэф', 'процент', 'изменение, %']):
+                    result[rus_key] = f"{value:.2f}%"
+                elif 'объём' in key_lower or 'объем' in key_lower:
+                    result[rus_key] = f"{value:.3f} л"
+                elif 'вес' in key_lower:
+                    result[rus_key] = f"{value:.2f} кг"
+                else:
+                    result[rus_key] = value
+            # Списки чисел – оставляем как есть, но можно рекурсивно обработать каждый элемент, если это словари
+            elif isinstance(value, list):
+                if value and isinstance(value[0], dict):
+                    result[rus_key] = [self._format_details_for_display(item) for item in value]
+                else:
+                    result[rus_key] = value
+            else:
+                result[rus_key] = value
+
+        return result
+
     async def log(self,
                   level: str,
                   message: str,
@@ -67,7 +237,12 @@ class DatabaseLogger:
                         level,
                         vendor_code,
                         message,
-                        json.dumps(enriched_details, ensure_ascii=False, default=str) if enriched_details else None,
+                        json.dumps(
+                            self._format_details_for_display(enriched_details),
+                            ensure_ascii=False,
+                            indent=2,  # Добавим отступы для красоты
+                            default=str
+                        ) if enriched_details else None,
                         self.cycle_id,
                         datetime.now(pytz.timezone('Europe/Moscow')),
                         mp  # ✅ Обязательно сохраняем mp
