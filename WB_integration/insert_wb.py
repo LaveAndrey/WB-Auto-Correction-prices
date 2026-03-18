@@ -152,6 +152,29 @@ class NoSalesPriceUpdater:
     def get_warehouse_tariff(self):
         """Получение тарифов логистики для склада"""
         try:
+            # Проверяем, нужно ли использовать фиксированные тарифы
+            if Config.USE_FIXED_TARIFF:
+                logger.info("📦 Используем ФИКСИРОВАННЫЕ тарифы логистики из конфига")
+                logger.info(f"   Доставка: база {Config.FIXED_DELIVERY_BASE}₽ + {Config.FIXED_DELIVERY_LITER}₽/л")
+
+                # Получаем ID склада для информации
+                warehouse_id = self.get_last_active_warehouse_id()
+                logger.info(f"📦 Работаем со складом ID: {warehouse_id}, тип поставки: {self.box_type_id}")
+
+                # Устанавливаем фиксированные тарифы
+                self.warehouse_tariff = {
+                    'warehouse_id': warehouse_id,
+                    'warehouse_name': 'Фиксированный тариф',
+                    'delivery_base': Config.FIXED_DELIVERY_BASE,
+                    'delivery_liter': Config.FIXED_DELIVERY_LITER,
+                    'storage_base': 0.0,  # Не используем в расчетах
+                    'storage_liter': 0.0  # Не используем в расчетах
+                }
+
+                logger.info(f"✅ Установлены фиксированные тарифы")
+                return True
+
+            # Если не фиксированные, то получаем из API как обычно
             warehouse_id = self.get_last_active_warehouse_id()
             logger.info(f"📦 Работаем со складом ID: {warehouse_id}, тип поставки: {self.box_type_id}")
 
